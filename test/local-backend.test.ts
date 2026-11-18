@@ -238,12 +238,18 @@ describe.each(modes)("exec, containment $containment", ({ containment }) => {
 		expect(pipe.stderr).toBe("");
 	});
 
-	test("the command cannot reach the backend's status channel", async () => {
-		// fd 3 carries the namespace init's report in full mode; the command's
-		// copy is closed, so it cannot fake a signal death.
+	test("an inherited fd 3 is not a channel: writing to it does not fake a signal", async () => {
 		const result = await local.exec("echo 15 >&3", { cwd: local.root });
 		expect(result.exitCode).toBe(1);
 		expect(result.signal).toBeNull();
+	});
+
+	test.if(containment === "full")("the report file is removed after every command", async () => {
+		const before = (await fs.readdir(os.tmpdir())).filter(n => n.startsWith("omp-sandbox-status-")).length;
+		await local.exec("kill -TERM $$", { cwd: local.root });
+		await local.exec("true", { cwd: local.root });
+		const after = (await fs.readdir(os.tmpdir())).filter(n => n.startsWith("omp-sandbox-status-")).length;
+		expect(after).toBe(before);
 	});
 
 	test("refuses a cwd outside the root or through a symlink", async () => {
@@ -442,5 +448,78 @@ describe("confinement: file operations never reach the host", () => {
 		expect(swaps).toBeGreaterThan(100);
 		expect(reads).toBeGreaterThan(0);
 		expect(writes).toBeGreaterThan(0);
+	});
+});
+
+/** Runs a Backend.shellCommand line the way a host shell would, from an unrelated cwd. */
+async function runLine(line: string): Promise<{ code: number; stdout: string; stderr: string }> {
+	const child = Bun.spawn(["/bin/bash", "-c", line], { cwd: os.tmpdir(), stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+	return { code, stdout, stderr };
+}
+
+describe.each(modes)("shellCommand, containment $containment", ({ containment }) => {
+	let local: LocalBackend;
+	beforeEach(async () => {
+		local = await LocalBackend.create(sandboxDir, { containment });
+	});
+	afterEach(async () => {
+		await local.close();
+	});
+
+	test("runs in the sandbox cwd with the sandbox environment, never the host's", async () => {
+		await fs.mkdir(path.join(sandboxDir, "sub"));
+		process.env.OMP_SANDBOX_HOST_SECRET = "must-not-leak";
+		try {
+			const line = local.shellCommand('pwd; echo "[$OMP_SANDBOX_HOST_SECRET][$EXTRA][$HOME]"', {
+				cwd: path.join(local.root, "sub"),
+				env: { EXTRA: "given" },
+			});
+			const result = await runLine(line);
+			expect(result.stdout).toBe(`${path.join(local.root, "sub")}\n[][given][${local.root}]\n`);
+			expect(result.code).toBe(0);
+		} finally {
+			delete process.env.OMP_SANDBOX_HOST_SECRET;
+		}
+	});
+
+	test("passes the command through literally and reports its exit code and stderr", async () => {
+		const result = await runLine(local.shellCommand(`echo 'it'"'"'s $HOME' "\\$x"; echo oops >&2; exit 3`, { cwd: local.root }));
+		expect(result.stdout).toBe(`it's $HOME $x\n`);
+		expect(result.stderr).toBe("oops\n");
+		expect(result.code).toBe(3);
+	});
+
+	test("a command ended by a signal exits 128+n, with nothing added to stderr", async () => {
+		const result = await runLine(local.shellCommand("kill -TERM $$", { cwd: local.root }));
+		expect(result.code).toBe(143);
+		expect(result.stderr).toBe("");
+	});
+
+	test("starts with an absolute program path, never cd or a bare name", () => {
+		const line = local.shellCommand("cd sub && make", { cwd: local.root });
+		expect(line.startsWith("/usr/bin/env ")).toBe(true);
+	});
+
+	test("refuses a cwd outside the root and invalid environment names", () => {
+		expect(() => local.shellCommand("true", { cwd: hostDir })).toThrow(BackendError);
+		expect(() => local.shellCommand("true", { cwd: local.root, env: { "BAD-NAME": "x" } })).toThrow(BackendError);
+		expect(() => local.shellCommand("true", { cwd: local.root, env: { OK: "a\0b" } })).toThrow(BackendError);
+	});
+
+	test.if(containment === "full")("killing the line's process kills everything the command started", async () => {
+		const escaped = uniqueSleep();
+		const child = Bun.spawn(["/bin/bash", "-c", local.shellCommand(`setsid sleep ${escaped} & echo started; wait`, { cwd: local.root })], {
+			cwd: os.tmpdir(),
+			stdout: "pipe",
+			detached: true,
+		});
+		const reader = child.stdout.getReader();
+		const first = await reader.read(); // "started": the escaped sleep exists
+		expect(new TextDecoder().decode(first.value)).toContain("started");
+		// The caller kills the process group it started, as omp's bash does.
+		process.kill(-child.pid, "SIGKILL");
+		await child.exited;
+		expect(await survivorsOf(escaped)).toEqual([]);
 	});
 });

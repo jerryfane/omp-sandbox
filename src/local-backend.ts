@@ -2,9 +2,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { constants, readdirSync, readFileSync, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
+import * as os from "node:os";
 import { constants as osConstants } from "node:os";
 import * as path from "node:path";
-import { Readable } from "node:stream";
 import {
 	type Backend,
 	BackendError,
@@ -17,6 +17,7 @@ import {
 	type ListOptions,
 	type ListResult,
 	type OutputStream,
+	type ShellCommandOptions,
 } from "./backend.ts";
 
 /** Environment every LocalBackend command starts from. Nothing comes from the host. */
@@ -24,6 +25,13 @@ const BASE_ENV: Readonly<Record<string, string>> = {
 	PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	LANG: "C.UTF-8",
 };
+
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Quote `text` as one POSIX shell word. */
+function shellQuote(text: string): string {
+	return `'${text.replaceAll("'", "'\\''")}'`;
+}
 
 /**
  * In process-tree mode, how long to keep reading after the shell exits. A
@@ -43,18 +51,28 @@ const O_WRITE = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | con
  * exits, the kernel kills everything left in the namespace.
  *
  * A shell init cannot tell "killed by SIGTERM" from "exit 143", so when the
- * command dies of a signal the init writes the signal number to fd 3, a pipe
- * only it holds (the command's copy is closed before exec). It prints
- * nothing of its own, except when bash cannot be started at all.
+ * command dies of a signal the init writes the signal number to its report
+ * file (argv[1]; "-" for none), in a fresh 0700 directory the backend made
+ * for that one command. It prints nothing of its own, except when bash cannot
+ * be started at all. Its exit status is the command's, or 128+n for signal n.
+ * (A file, not an inherited pipe: Bun emulates extra stdio pipes over a Unix
+ * socket whose connect intermittently fails under load.) A command running as
+ * the same user could find and overwrite that file; LocalBackend isolates
+ * nothing.
  *
  * Python ignores SIGPIPE and SIGXFSZ at startup, and exec keeps an ignored
  * disposition, so the child resets every signal to its default before exec:
  * the command must see the same signals it would without the init.
  */
 const NAMESPACE_INIT = `import os, signal, sys
+report_path = None if sys.argv[1] == "-" else sys.argv[1]
 def report(text):
+    if report_path is None:
+        return
     try:
-        os.write(3, text)
+        fd = os.open(report_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        os.write(fd, text)
+        os.close(fd)
     except OSError:
         pass
 pid = os.fork()
@@ -65,11 +83,7 @@ if pid == 0:
         except (OSError, ValueError):
             pass
     try:
-        os.close(3)
-    except OSError:
-        pass
-    try:
-        os.execvp("bash", ["bash", "-c", sys.argv[1]])
+        os.execv("/bin/bash", ["bash", "-c", sys.argv[2]])
     except OSError as error:
         os.write(2, ("omp-sandbox: cannot start bash: %s\\n" % error).encode())
         os._exit(127)
@@ -86,8 +100,22 @@ if os.WIFSIGNALED(status):
 os._exit(os.WEXITSTATUS(status))
 `;
 
-/** `python3 -I -S -c NAMESPACE_INIT <command>`: isolated mode, no site import. */
-const INIT_ARGS = ["python3", "-I", "-S", "-c", NAMESPACE_INIT];
+/**
+ * Always a user namespace too, also when running as root, so the namespace
+ * never holds real root (machine rule: no real-root namespace experiments on
+ * live hosts). Run as root, the namespace's uid 0 still maps to the real uid
+ * 0, so root-owned files stay accessible, but its capabilities are confined to
+ * the new namespaces. Never a mount namespace or a /proc remount.
+ */
+const NAMESPACE_FLAGS: readonly string[] = ["--user", "--map-root-user", "--pid", "--fork", "--kill-child"];
+
+/**
+ * `unshare <flags> -- python3 -I -S -c NAMESPACE_INIT <report-file> <command>`:
+ * absolute paths, Python in isolated mode with no site import.
+ */
+function namespaceArgv(reportFile: string, command: string): string[] {
+	return ["/usr/bin/unshare", ...NAMESPACE_FLAGS, "--", "/usr/bin/python3", "-I", "-S", "-c", NAMESPACE_INIT, reportFile, command];
+}
 
 const SIGNAL_NAMES: ReadonlyMap<number, NodeJS.Signals> = new Map(
 	Object.entries(osConstants.signals).map(([name, number]) => [number, name as NodeJS.Signals]),
@@ -170,29 +198,19 @@ export class LocalBackend implements Backend {
 		}
 
 		const full = this.containment === "full";
-		const child = full
-			? spawn("unshare", [...namespaceFlags(), "--", ...INIT_ARGS, command], {
-					cwd,
-					env: { ...BASE_ENV, HOME: this.root, ...options.env },
-					detached: true, // own process group
-					stdio: ["ignore", "pipe", "pipe", "pipe"], // fd 3: the init's status channel
-				})
-			: spawn("bash", ["-c", command], {
-					cwd,
-					env: { ...BASE_ENV, HOME: this.root, ...options.env },
-					detached: true,
-					stdio: ["ignore", "pipe", "pipe"],
-				});
+		const env = this.#environment(options.env);
+		const statusDir = full ? await fs.mkdtemp(path.join(os.tmpdir(), "omp-sandbox-status-")) : undefined;
+		const statusFile = statusDir === undefined ? undefined : path.join(statusDir, "signal");
+		const [file, ...args] = statusFile === undefined ? ["/bin/bash", "-c", command] : namespaceArgv(statusFile, command);
+		if (file === undefined) throw new Error("empty argv");
+		const child = spawn(file, args, {
+			cwd,
+			env,
+			detached: true, // own process group
+			stdio: ["ignore", "pipe", "pipe"],
+		});
 		const { stdout, stderr } = child;
 		if (stdout === null || stderr === null) throw new Error("spawned with piped stdout and stderr");
-		let initStatus = "";
-		const statusPipe = child.stdio[3];
-		if (statusPipe instanceof Readable) {
-			statusPipe.setEncoding("utf8");
-			statusPipe.on("data", (text: string) => {
-				initStatus += text;
-			});
-		}
 		const kill = () => {
 			if (child.pid !== undefined) killTree(child.pid);
 		};
@@ -249,20 +267,35 @@ export class LocalBackend implements Backend {
 			clearTimeout(drain);
 			done.resolve();
 		});
+		let reportedText = "";
 		try {
 			await done.promise;
+			if (statusFile !== undefined) reportedText = await fs.readFile(statusFile, "utf8").catch(() => "");
 		} finally {
 			clearTimeout(timer);
 			options.signal?.removeEventListener("abort", onAbort);
-			if (statusPipe instanceof Readable) statusPipe.destroy();
+			if (statusDir !== undefined) await fs.rm(statusDir, { recursive: true, force: true });
 		}
 		// The init survived and reported that the command itself died of a signal.
-		const reported = SIGNAL_NAMES.get(Number.parseInt(initStatus, 10));
+		const reported = SIGNAL_NAMES.get(Number.parseInt(reportedText, 10));
 		if (full && result.signal === null && reported !== undefined) {
 			result.exitCode = null;
 			result.signal = reported;
 		}
 		return result;
+	}
+
+	shellCommand(command: string, options: ShellCommandOptions): string {
+		// Lexical check only (this is synchronous and touches nothing): the
+		// cwd must be inside the root. `env -C` refuses one that is missing.
+		this.#components(options.cwd);
+		const cwd = normalizeAbsolute(options.cwd);
+		const env = Object.entries(this.#environment(options.env)).map(([name, value]) => shellQuote(`${name}=${value}`));
+		const program =
+			this.containment === "full" ? namespaceArgv("-", command) : ["/bin/bash", "-c", command];
+		// `env -i -C`: an empty environment plus our own, and the cwd, without a
+		// leading `cd` and without the host shell's in-process `env`.
+		return ["/usr/bin/env", "-i", "-C", shellQuote(cwd), ...env, ...program.map(shellQuote)].join(" ");
 	}
 
 	async readFile(file: string): Promise<Uint8Array> {
@@ -379,6 +412,18 @@ export class LocalBackend implements Backend {
 		await this.#rootDir.close();
 	}
 
+	/** The environment a command starts from: BASE_ENV, HOME, then `extra`. */
+	#environment(extra: Record<string, string> | undefined): Record<string, string> {
+		const env: Record<string, string> = { ...BASE_ENV, HOME: this.root };
+		for (const [name, value] of Object.entries(extra ?? {})) {
+			if (!ENV_NAME.test(name) || value.includes("\0")) {
+				throw new BackendError("INVALID_ENV", name, `invalid environment variable: ${name}`);
+			}
+			env[name] = value;
+		}
+		return env;
+	}
+
 	/** The components of `file` below the root; [] for the root itself. */
 	#components(file: string): string[] {
 		const normalized = normalizeAbsolute(file);
@@ -447,22 +492,11 @@ let pidNamespaceSupport: boolean | undefined;
 
 /** Whether `unshare` can run the namespace init here (probed once per process). */
 function canCreatePidNamespace(): boolean {
-	pidNamespaceSupport ??=
-		spawnSync("unshare", [...namespaceFlags(), "--", ...INIT_ARGS, "true"], { stdio: "ignore" }).status === 0;
+	if (pidNamespaceSupport === undefined) {
+		const [file, ...args] = namespaceArgv("-", "true");
+		pidNamespaceSupport = file !== undefined && spawnSync(file, args, { stdio: "ignore" }).status === 0;
+	}
 	return pidNamespaceSupport;
-}
-
-/**
- * Always a user namespace too, also when running as root, so the namespace
- * never holds real root (machine rule: no real-root namespace experiments on
- * live hosts). Run as root, the namespace's uid 0 still maps to the real uid
- * 0, so root-owned files stay accessible, but its capabilities are confined to
- * the new namespaces. Never a mount namespace or a /proc remount.
- */
-const NAMESPACE_FLAGS: readonly string[] = ["--user", "--map-root-user", "--pid", "--fork", "--kill-child"];
-
-function namespaceFlags(): readonly string[] {
-	return NAMESPACE_FLAGS;
 }
 
 /**
