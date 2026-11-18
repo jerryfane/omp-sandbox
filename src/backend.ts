@@ -38,6 +38,13 @@ export interface ExecOptions {
 	maxOutputBytes?: number;
 }
 
+export interface ShellCommandOptions {
+	/** Absolute sandbox path the command runs in. */
+	cwd: string;
+	/** Extra environment variables, as for ExecOptions.env. */
+	env?: Record<string, string>;
+}
+
 export interface ExecResult {
 	/** The command's exit code, or null when it was ended by a signal. */
 	exitCode: number | null;
@@ -98,6 +105,27 @@ export interface Backend {
 	 * stderr carry only the command's own output; the backend adds nothing.
 	 */
 	exec(command: string, options: ExecOptions): Promise<ExecResult>;
+	/**
+	 * A host shell command line that runs `command` (`bash -c`) in the sandbox,
+	 * for a caller that runs processes itself: omp's own bash tool runs this
+	 * line, so its background jobs, timeouts and output handling keep working.
+	 *
+	 * The line:
+	 * - streams the command's stdout and stderr live and connects no stdin;
+	 * - exits with the command's exit code, or 128+n when signal n ended it;
+	 * - calls external programs by absolute path only, so a host shell with
+	 *   in-process builtins (omp's embedded bash has its own `env`) cannot
+	 *   run them inside its own process;
+	 * - does not start with `cd` (omp rewrites a leading `cd x &&`).
+	 *
+	 * When the caller kills the process it started for the line, everything
+	 * the command started must die too: the backend's containment guarantee
+	 * applies, for a gitmoot workspace through its exec watchdog.
+	 *
+	 * Synchronous and side-effect free: it only builds the string. It throws a
+	 * BackendError for a cwd outside the root or an invalid environment name.
+	 */
+	shellCommand(command: string, options: ShellCommandOptions): string;
 	/** Read a whole regular file. Rejects with BackendError("ENOENT") when missing. */
 	readFile(path: string): Promise<Uint8Array>;
 	/**
@@ -133,7 +161,9 @@ export type BackendErrorCode =
 	/** The path names a FIFO, socket or device, not a regular file. */
 	| "NOT_REGULAR"
 	/** The sandbox refused access (permissions). */
-	| "EACCES";
+	| "EACCES"
+	/** An environment variable name is not a valid shell name, or a value contains NUL. */
+	| "INVALID_ENV";
 
 export class BackendError extends Error {
 	readonly code: BackendErrorCode;
