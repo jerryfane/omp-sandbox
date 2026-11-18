@@ -1,7 +1,8 @@
 /**
- * Type declarations for the part of omp's extension API this add-on uses,
- * mirrored from @oh-my-pi/pi-coding-agent and @oh-my-pi/pi-agent-core 18.20.0
- * (extensibility/extensions/types.d.ts, types.d.ts).
+ * Type declarations for the part of omp this add-on uses, mirrored from
+ * @oh-my-pi/pi-coding-agent and @oh-my-pi/pi-agent-core 18.20.0
+ * (extensibility/extensions/types.d.ts, types.d.ts, tools/bash.d.ts,
+ * config/settings.d.ts).
  *
  * The real modules are provided by the omp binary at runtime. Installing the
  * packages only for their types would pull in about 60 MB of dependencies.
@@ -12,6 +13,7 @@ declare module "@oh-my-pi/pi-coding-agent" {
 	/** The subset of omp's bundled zod used to declare tool parameters. */
 	export interface ZodSchema {
 		optional(): ZodSchema;
+		max(length: number): ZodSchema;
 	}
 
 	export interface Zod {
@@ -47,6 +49,21 @@ declare module "@oh-my-pi/pi-coding-agent" {
 		): Promise<AgentToolResult>;
 	}
 
+	/** omp's session settings (opaque here; only passed back to omp). */
+	export type OmpSettings = object;
+
+	/** What omp passes a tool's approval function (AgentToolContext, the fields used here). */
+	export interface ApprovalContext {
+		settings?: OmpSettings;
+		toolNames?: string[];
+	}
+
+	export type ToolTier = "read" | "write" | "exec";
+
+	export type ToolApprovalDecision =
+		| ToolTier
+		| { tier: ToolTier; override?: boolean; policy?: "allow" | "deny" | "prompt"; reason?: string; policyKey?: string };
+
 	export interface ToolDefinition<TParams> {
 		name: string;
 		label: string;
@@ -54,8 +71,8 @@ declare module "@oh-my-pi/pi-coding-agent" {
 		parameters: ZodSchema;
 		/** Extension tools default to "discoverable"; "essential" keeps a tool top-level. */
 		loadMode?: "essential" | "discoverable";
-		/** Approval tier; defaults to "exec". */
-		approval?: "read" | "write" | "exec";
+		/** Approval tier or per-call decision; defaults to "exec". */
+		approval?: ToolApprovalDecision | ((args: unknown, ctx?: ApprovalContext) => ToolApprovalDecision);
 		execute(
 			toolCallId: string,
 			params: TParams,
@@ -68,6 +85,25 @@ declare module "@oh-my-pi/pi-coding-agent" {
 	export interface ExtensionAPI {
 		readonly zod: Zod;
 		registerTool<TParams>(tool: ToolDefinition<TParams>): void;
+	}
+}
+
+declare module "@oh-my-pi/pi-coding-agent/tools/bash" {
+	import type { ApprovalContext, OmpSettings, ToolApprovalDecision } from "@oh-my-pi/pi-coding-agent";
+
+	/** omp's built-in bash; constructed here only for its approval rules, which read nothing but settings. */
+	export class BashTool {
+		constructor(session: { settings: OmpSettings });
+		readonly approval: (args: unknown, ctx?: ApprovalContext) => ToolApprovalDecision;
+	}
+}
+
+declare module "@oh-my-pi/pi-coding-agent/config/settings" {
+	import type { OmpSettings } from "@oh-my-pi/pi-coding-agent";
+
+	export class Settings {
+		/** The process settings (omp's main session uses this object). */
+		static get instance(): OmpSettings;
 	}
 }
 

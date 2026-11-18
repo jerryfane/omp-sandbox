@@ -192,27 +192,96 @@ describe.if(ompInstalled)("installed omp with the extension (LocalBackend)", () 
 		expect(await fs.readdir(hostDir)).toEqual([]);
 	}, 120_000);
 
-	test("the shadow bash declares the same parameters as omp's native bash", async () => {
-		// The extension mirrors the schema by hand (it cannot read it at load
-		// time); this catches a drift when omp's bash gains or drops a field.
-		const probe = path.join(scratch, "schema-probe.ts");
+	test("omp's own bash approval rules judge the command the agent wrote", async () => {
+		// write mode: exec-tier calls need a prompt, which print mode cannot show,
+		// so they fail; bash.patterns decide per command. Matches native bash.
+		const agentDir = path.join(scratch, "agent-approval");
+		await fs.mkdir(agentDir, { recursive: true });
 		await fs.writeFile(
-			probe,
-			`export default function (pi) { pi.on("session_start", async () => { const t = pi.getAllTools().find(x => x.name === "bash"); process.stderr.write("BASH-EXPR " + t.parameters.expression + "\\n"); }); }\n`,
+			path.join(agentDir, "config.yml"),
+			[
+				"tools:",
+				"  approvalMode: write",
+				"bash:",
+				"  patterns:",
+				'    - { match: "touch denied-*", approval: deny }',
+				'    - { match: "touch asked-*", approval: prompt }',
+				'    - { match: "touch allowed-*", approval: allow }',
+				"",
+			].join("\n"),
 		);
-		const child = Bun.spawn(
-			[OMP, "--trusted-extension", path.join(import.meta.dir, "fixtures/scripted-provider.ts"), "--trusted-extension", probe, "--model", "scripted/scripted-1", "--no-session", "-p", "go"],
-			{
+		const run = await runOmp(
+			[
+				bash({ command: "touch denied-marker" }),
+				bash({ command: "touch asked-marker" }),
+				bash({ command: "touch allowed-marker" }),
+				bash({ command: "touch plain-marker" }),
+			],
+			{ PI_CODING_AGENT_DIR: agentDir },
+		);
+		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
+		expect(byId.get("call_0")?.text).toContain("Blocked by bash pattern: touch denied-*");
+		expect(byId.get("call_1")?.text).toContain("requires approval");
+		expect(byId.get("call_2")?.isError).toBe(false);
+		expect(byId.get("call_3")?.text).toContain("requires approval");
+		const sandboxFiles = await fs.readdir(sandboxDir);
+		expect(sandboxFiles).toContain("allowed-marker");
+		for (const blocked of ["denied-marker", "asked-marker", "plain-marker"]) expect(sandboxFiles).not.toContain(blocked);
+		expect(await fs.readdir(hostDir)).toEqual([]);
+	}, 120_000);
+
+	test("the shadow bash offers the model the same parameters as omp's native bash", async () => {
+		// The extension mirrors the schema by hand (it cannot read it at load
+		// time). A provider records the bash schema omp sends the model, once
+		// with native bash and once with the extension loaded.
+		const recorder = path.join(scratch, "schema-recorder.ts");
+		await fs.writeFile(
+			recorder,
+			`import { appendFileSync } from "node:fs";
+const model = { id: "r1", name: "R", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 16000 };
+export default function (pi) {
+	pi.registerProvider("recorder", { baseUrl: "https://recorder.invalid/", apiKey: "unused", api: "recorder-api", models: [model],
+		streamSimple(_model, context) {
+			const bash = (context.tools ?? []).find(t => t.name === "bash");
+			appendFileSync(process.env.SCHEMA_OUT, JSON.stringify(bash?.parameters ?? null) + "\\n");
+			throw new Error("schema recorded");
+		} });
+}
+`,
+		);
+		const schemaFor = async (withExtension: boolean): Promise<unknown> => {
+			const out = path.join(scratch, `schema-${withExtension}.jsonl`);
+			const extensions = ["--trusted-extension", recorder];
+			if (withExtension) extensions.push("--trusted-extension", path.resolve(import.meta.dir, "../src/extension.ts"));
+			const child = Bun.spawn([OMP, ...extensions, "--model", "recorder/r1", "--no-session", "-p", "go"], {
 				cwd: hostDir,
-				env: { HOME: path.join(scratch, "home"), PATH: "/usr/local/bin:/usr/bin:/bin", TERM: "dumb", PI_CODING_AGENT_DIR: path.join(scratch, "agent"), PI_CONFIG_DIR: path.join(scratch, "config"), OMP_SANDBOX_SCRIPT: "[]" },
+				env: {
+					HOME: path.join(scratch, "home"),
+					PATH: "/usr/local/bin:/usr/bin:/bin",
+					TERM: "dumb",
+					PI_CODING_AGENT_DIR: path.join(scratch, "agent"),
+					PI_CONFIG_DIR: path.join(scratch, "config"),
+					SCHEMA_OUT: out,
+					OMP_SANDBOX_BACKEND: "local",
+					OMP_SANDBOX_LOCAL_ROOT: sandboxDir,
+					OMP_SANDBOX_HOST_ROOT: hostDir,
+				},
 				stdout: "ignore",
-				stderr: "pipe",
-			},
-		);
-		const stderr = await new Response(child.stderr).text();
-		await child.exited;
-		const expression = stderr.split("\n").find(l => l.startsWith("BASH-EXPR "))?.slice("BASH-EXPR ".length) ?? "";
-		const native = [...expression.replace(/ready\?: \{[^}]*\}/, "ready?: {}").matchAll(/(\w+)\??:/g)].map(m => m[1]).sort();
-		expect(native).toEqual(["async", "command", "cwd", "name", "pty", "ready", "timeout"]);
+				stderr: "ignore",
+			});
+			await child.exited;
+			return JSON.parse((await fs.readFile(out, "utf8")).split("\n")[0] ?? "null");
+		};
+		const native = await schemaFor(false);
+		const shadow = await schemaFor(true);
+		expect(native).toMatchObject({ type: "object", properties: { command: { type: "string" } } });
+		// Descriptions are prose and may differ; names, types, bounds and requiredness must not.
+		expect(stripDescriptions(shadow)).toEqual(stripDescriptions(native));
 	}, 120_000);
 });
+
+function stripDescriptions(schema: unknown): unknown {
+	if (Array.isArray(schema)) return schema.map(stripDescriptions);
+	if (schema === null || typeof schema !== "object") return schema;
+	return Object.fromEntries(Object.entries(schema).filter(([key]) => key !== "description").map(([key, value]) => [key, stripDescriptions(value)]));
+}

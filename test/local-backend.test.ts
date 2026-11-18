@@ -129,6 +129,28 @@ describe.each(modes)("exec, containment $containment", ({ containment }) => {
 		}
 	});
 
+	test("an environment entry named __proto__ is passed like any other", async () => {
+		const result = await local.exec("printenv __proto__", { cwd: local.root, env: JSON.parse('{"__proto__":"sentinel"}') });
+		expect(result.stdout).toBe("sentinel\n");
+		expect(result.exitCode).toBe(0);
+	});
+
+	test("a command that cannot be started leaves no temporary files behind", async () => {
+		// os.tmpdir() follows TMPDIR, so the status directory lands somewhere observable.
+		const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sandbox-tmpdir-"));
+		const saved = process.env.TMPDIR;
+		process.env.TMPDIR = tmp;
+		try {
+			// One argument above the kernel's 128 KiB limit: spawn fails with E2BIG.
+			await expect(local.exec(`: ${"x".repeat(200_000)}`, { cwd: local.root })).rejects.toThrow();
+			expect(await fs.readdir(tmp)).toEqual([]);
+		} finally {
+			if (saved === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = saved;
+			await fs.rm(tmp, { recursive: true, force: true });
+		}
+	});
+
 	test("streams output in arrival order", async () => {
 		const chunks: string[] = [];
 		// The sleeps run inside the command, so each line arrives as its own chunk.
@@ -481,6 +503,12 @@ describe.each(modes)("shellCommand, containment $containment", ({ containment })
 		} finally {
 			delete process.env.OMP_SANDBOX_HOST_SECRET;
 		}
+	});
+
+	test("an environment entry named __proto__ is passed like any other", async () => {
+		const result = await runLine(local.shellCommand("printenv __proto__", { cwd: local.root, env: JSON.parse('{"__proto__":"sentinel"}') }));
+		expect(result.stdout).toBe("sentinel\n");
+		expect(result.code).toBe(0);
 	});
 
 	test("passes the command through literally and reports its exit code and stderr", async () => {

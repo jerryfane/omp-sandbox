@@ -18,7 +18,8 @@ So omp's background jobs (`async`), auto-backgrounding, timeouts, streaming and 
 
 - **`cwd`** is mapped from the host workspace onto the sandbox root (`PathMap`). A `cwd` outside the workspace is refused.
 - **Refused:** `pty` and named services (`name`/`ready`). Both would run on this machine.
-- **Fail closed:** if the add-on is configured but its backend cannot be set up, `bash` refuses every call instead of running on the host.
+- **Approvals:** each call is judged by **omp's own bash approval rules**: `tools.approvalMode`, `tools.approval.bash`, `bash.patterns` allow/prompt/deny, the bash interceptor, and critical-command prompts. They are applied to the command the agent wrote, not the rewritten line. The delegated native call is not gated a second time. The add-on gets these rules by importing omp's `BashTool` (`@oh-my-pi/pi-coding-agent/tools/bash`), whose approval reads only settings.
+- **Fail closed:** if the add-on is configured but its backend cannot be set up, or omp's bash approval rules cannot be loaded, `bash` refuses every call instead of running on the host.
 - **Known gap:** omp's background-job notices show the rewritten command line. A real backend keeps it short; for gitmoot it is `gitmoot ws sh …`.
 
 Configuration, in the omp process's environment:

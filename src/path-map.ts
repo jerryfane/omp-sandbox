@@ -41,7 +41,7 @@ export class PathMap {
 		const resolved = trimSlash(path.resolve(base, file));
 		const relative = path.relative(this.hostRoot, resolved);
 		if (relative === "") return this.sandboxRoot;
-		if (relative.startsWith("..") || path.isAbsolute(relative)) {
+		if (escapesRoot(relative, path.sep) || path.isAbsolute(relative)) {
 			throw new OutsideWorkspaceError(file, this.hostRoot);
 		}
 		return path.posix.join(this.sandboxRoot, ...relative.split(path.sep));
@@ -52,9 +52,14 @@ export class PathMap {
 		const normalized = trimSlash(path.posix.normalize(sandboxPath));
 		const relative = path.posix.relative(this.sandboxRoot, normalized);
 		if (relative === "") return this.hostRoot;
-		if (relative.startsWith("..") || path.posix.isAbsolute(relative)) return null;
+		if (escapesRoot(relative, "/") || path.posix.isAbsolute(relative)) return null;
 		return path.join(this.hostRoot, ...relative.split("/"));
 	}
+}
+
+/** A relative path that climbs out of its root: `..` or `../…`, not a name like `..cache`. */
+function escapesRoot(relative: string, sep: string): boolean {
+	return relative === ".." || relative.startsWith(`..${sep}`);
 }
 
 function trimSlash(file: string): string {

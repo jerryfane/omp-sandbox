@@ -200,12 +200,33 @@ export class LocalBackend implements Backend {
 		const full = this.containment === "full";
 		const env = this.#environment(options.env);
 		const statusDir = full ? await fs.mkdtemp(path.join(os.tmpdir(), "omp-sandbox-status-")) : undefined;
-		const statusFile = statusDir === undefined ? undefined : path.join(statusDir, "signal");
+		try {
+			return await this.#run(command, cwd, env, limit, result, options, statusDir === undefined ? undefined : path.join(statusDir, "signal"));
+		} finally {
+			// Also after a synchronous spawn failure (E2BIG, ENOENT) inside #run.
+			if (statusDir !== undefined) await fs.rm(statusDir, { recursive: true, force: true });
+		}
+	}
+
+	/** Spawns the command (in the namespace when `statusFile` is set) and collects the result. */
+	async #run(
+		command: string,
+		cwd: string,
+		env: Record<string, string>,
+		limit: number,
+		result: ExecResult,
+		options: ExecOptions,
+		statusFile: string | undefined,
+	): Promise<ExecResult> {
 		const [file, ...args] = statusFile === undefined ? ["/bin/bash", "-c", command] : namespaceArgv(statusFile, command);
 		if (file === undefined) throw new Error("empty argv");
-		const child = spawn(file, args, {
+		// The environment goes in as `env -i NAME=VALUE` arguments, as in
+		// shellCommand: Bun's async spawn drops an entry named `__proto__` from
+		// an env object, even a null-prototype one. env execs, so the pid and
+		// process group are the command's.
+		const child = spawn("/usr/bin/env", ["-i", ...Object.entries(env).map(([name, value]) => `${name}=${value}`), file, ...args], {
 			cwd,
-			env,
+			env: {},
 			detached: true, // own process group
 			stdio: ["ignore", "pipe", "pipe"],
 		});
@@ -274,11 +295,10 @@ export class LocalBackend implements Backend {
 		} finally {
 			clearTimeout(timer);
 			options.signal?.removeEventListener("abort", onAbort);
-			if (statusDir !== undefined) await fs.rm(statusDir, { recursive: true, force: true });
 		}
 		// The init survived and reported that the command itself died of a signal.
 		const reported = SIGNAL_NAMES.get(Number.parseInt(reportedText, 10));
-		if (full && result.signal === null && reported !== undefined) {
+		if (statusFile !== undefined && result.signal === null && reported !== undefined) {
 			result.exitCode = null;
 			result.signal = reported;
 		}
@@ -412,9 +432,12 @@ export class LocalBackend implements Backend {
 		await this.#rootDir.close();
 	}
 
-	/** The environment a command starts from: BASE_ENV, HOME, then `extra`. */
+	/**
+	 * The environment a command starts from: BASE_ENV, HOME, then `extra`.
+	 * A null-prototype record, so a name like `__proto__` is an ordinary entry.
+	 */
 	#environment(extra: Record<string, string> | undefined): Record<string, string> {
-		const env: Record<string, string> = { ...BASE_ENV, HOME: this.root };
+		const env: Record<string, string> = Object.assign(Object.create(null), BASE_ENV, { HOME: this.root });
 		for (const [name, value] of Object.entries(extra ?? {})) {
 			if (!ENV_NAME.test(name) || value.includes("\0")) {
 				throw new BackendError("INVALID_ENV", name, `invalid environment variable: ${name}`);

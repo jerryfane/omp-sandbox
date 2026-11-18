@@ -20,6 +20,12 @@ describe("toSandbox", () => {
 		expect(() => map.toSandbox("x", "/tmp")).toThrow(OutsideWorkspaceError);
 	});
 
+	test("names that merely begin with two dots are inside the workspace", () => {
+		expect(map.toSandbox("..cache")).toBe("/home/user/work/..cache");
+		expect(map.toSandbox("..config/sub")).toBe("/home/user/work/..config/sub");
+		expect(map.toSandbox("/home/seat/work/repo/...")).toBe("/home/user/work/...");
+	});
+
 	test("a sandbox root of / maps without a doubled slash", () => {
 		const rooted = new PathMap("/home/seat/repo", "/");
 		expect(rooted.toSandbox("a/b")).toBe("/a/b");
@@ -33,5 +39,11 @@ describe("toHost", () => {
 		expect(map.toHost("/home/user/work/src/a.ts")).toBe("/home/seat/work/repo/src/a.ts");
 		expect(map.toHost("/home/user/workspace/x")).toBeNull();
 		expect(map.toHost("/etc")).toBeNull();
+	});
+
+	test("sandbox names that begin with two dots map back", () => {
+		expect(map.toHost("/home/user/work/..cache")).toBe("/home/seat/work/repo/..cache");
+		expect(map.toHost("/home/user/work/..config/sub")).toBe("/home/seat/work/repo/..config/sub");
+		expect(map.toHost("/home/user/work/..")).toBeNull();
 	});
 });
