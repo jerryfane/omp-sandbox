@@ -41,6 +41,7 @@ import { Mirror } from "./mirror.ts";
 import { PathMap } from "./path-map.ts";
 
 type BashApproval = (args: unknown, ctx?: ApprovalContext) => ToolApprovalDecision;
+type BashApprovalDetails = (args: unknown) => string[];
 
 const TOOL_DESCRIPTION = `Run a bash command in the sandbox: the workspace's files, builds and tests live there, not on this machine.
 Paths inside the workspace work as usual; anything outside it does not exist in the sandbox.
@@ -64,6 +65,8 @@ interface SandboxSetup {
 	mirror: Mirror;
 	parsers: TargetParsers;
 	approve: BashApproval;
+	/** The rows an approval prompt shows (omp's own: `Command: …`). */
+	approvalDetails: BashApprovalDetails;
 	/** The process settings: what omp's main session uses, for parsing file-tool targets. */
 	settings: () => OmpSettings;
 }
@@ -151,6 +154,12 @@ export default async function ompSandbox(pi: ExtensionAPI): Promise<void> {
 				return { tier: "exec", override: true, policy: "deny", reason: `omp-sandbox: omp's bash approval rules failed (${message})` };
 			}
 		},
+		// Without this the prompt says only "Allow tool: bash", without the command.
+		formatApprovalDetails: args => {
+			if (setup !== undefined) return setup.approvalDetails(args);
+			const command = (args as { command?: unknown } | undefined)?.command;
+			return [`Command: ${typeof command === "string" ? command : "(missing)"}`];
+		},
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const ready = usable();
 			if (typeof ready === "string") throw new Error(ready);
@@ -189,7 +198,7 @@ function errorMessage(error: unknown): string {
 }
 
 async function createSetup(kind: string): Promise<SandboxSetup> {
-	const { approve, settings } = await loadBashApproval();
+	const { approve, approvalDetails, settings } = await loadBashApproval();
 	const parsers = await loadTargetParsers(process.cwd(), settings());
 	let backend: Backend;
 	if (kind === "local") {
@@ -206,7 +215,7 @@ async function createSetup(kind: string): Promise<SandboxSetup> {
 	try {
 		const mirror = await Mirror.create(backend, process.cwd());
 		await mirror.pullRemote();
-		return { backend, paths: new PathMap(mirror.hostRoot, backend.root), mirror, parsers, approve, settings };
+		return { backend, paths: new PathMap(mirror.hostRoot, backend.root), mirror, parsers, approve, approvalDetails, settings };
 	} catch (error) {
 		await backend.close();
 		throw error;
@@ -221,7 +230,7 @@ async function createSetup(kind: string): Promise<SandboxSetup> {
  * moved module refuses bash (setup error) rather than failing the extension
  * load and leaving omp's host bash in place.
  */
-async function loadBashApproval(): Promise<{ approve: BashApproval; settings: () => OmpSettings }> {
+async function loadBashApproval(): Promise<{ approve: BashApproval; approvalDetails: BashApprovalDetails; settings: () => OmpSettings }> {
 	let modules: [typeof import("@oh-my-pi/pi-coding-agent/tools/bash"), typeof import("@oh-my-pi/pi-coding-agent/config/settings")];
 	try {
 		modules = await Promise.all([import("@oh-my-pi/pi-coding-agent/tools/bash"), import("@oh-my-pi/pi-coding-agent/config/settings")]);
@@ -231,14 +240,16 @@ async function loadBashApproval(): Promise<{ approve: BashApproval; settings: ()
 	const [{ BashTool }, { Settings }] = modules;
 	if (typeof BashTool !== "function" || typeof Settings !== "function") throw new Error("cannot load omp's bash approval rules: BashTool or Settings missing");
 	const bySettings = new WeakMap<object, InstanceType<typeof BashTool>>();
-	const approve: BashApproval = (args, ctx) => {
-		const settings = ctx?.settings ?? Settings.instance;
+	const toolFor = (settings: OmpSettings) => {
 		let tool = bySettings.get(settings);
 		if (tool === undefined) {
 			tool = new BashTool({ settings });
 			bySettings.set(settings, tool);
 		}
-		return tool.approval(args, ctx);
+		return tool;
 	};
-	return { approve, settings: () => Settings.instance };
+	const approve: BashApproval = (args, ctx) => toolFor(ctx?.settings ?? Settings.instance).approval(args, ctx);
+	const approvalDetails: BashApprovalDetails = args => toolFor(Settings.instance).formatApprovalDetails(args);
+	if (typeof toolFor(Settings.instance).formatApprovalDetails !== "function") throw new Error("cannot load omp's bash approval rules: formatApprovalDetails missing");
+	return { approve, approvalDetails, settings: () => Settings.instance };
 }

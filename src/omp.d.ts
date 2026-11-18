@@ -82,6 +82,8 @@ declare module "@oh-my-pi/pi-coding-agent" {
 		loadMode?: "essential" | "discoverable";
 		/** Approval tier or per-call decision; defaults to "exec". */
 		approval?: ToolApprovalDecision | ((args: unknown, ctx?: ApprovalContext) => ToolApprovalDecision);
+		/** Rows an approval prompt shows under "Allow tool: <name>". */
+		formatApprovalDetails?: (args: unknown) => string[];
 		execute(
 			toolCallId: string,
 			params: TParams,
@@ -135,6 +137,8 @@ declare module "@oh-my-pi/pi-coding-agent/tools/bash" {
 	export class BashTool {
 		constructor(session: { settings: OmpSettings });
 		readonly approval: (args: unknown, ctx?: ApprovalContext) => ToolApprovalDecision;
+		/** The approval prompt's rows for `args`, e.g. `Command: …`. */
+		readonly formatApprovalDetails: (args: unknown) => string[];
 	}
 }
 

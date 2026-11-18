@@ -370,6 +370,55 @@ export default function (pi) {
 		expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("host-only");
 	}, 120_000);
 
+	test("an interactive approval prompt shows the command the agent wrote, as for native bash, and its answer is followed", async () => {
+		// RPC mode with always-ask: each bash call raises omp's approval prompt.
+		const agentDir = path.join(scratch, "agent-always-ask");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(path.join(agentDir, "config.yml"), "tools:\n  approvalMode: always-ask\n");
+		const script = JSON.stringify([bash({ command: "touch approve-me" }), bash({ command: "touch deny-me" })]);
+		const drive = async (withExtension: boolean) => {
+			const hostDir = await freshHostDir();
+			const sandboxDir = await freshSandbox();
+			const extensions = ["--trusted-extension", path.join(import.meta.dir, "fixtures/scripted-provider.ts")];
+			if (withExtension) extensions.push("--trusted-extension", path.resolve(import.meta.dir, "../src/extension.ts"));
+			const child = Bun.spawn(
+				[process.execPath, path.join(import.meta.dir, "fixtures/rpc-approver.ts"), OMP, hostDir, ...extensions, "--model", "scripted/scripted-1", "--no-session"],
+				{
+					env: {
+						HOME: path.join(scratch, "home"),
+						PATH: "/usr/local/bin:/usr/bin:/bin",
+						TERM: "dumb",
+						PI_CODING_AGENT_DIR: agentDir,
+						PI_CONFIG_DIR: path.join(scratch, "config"),
+						OMP_SANDBOX_SCRIPT: script,
+						OMP_SANDBOX_BACKEND: "local",
+						OMP_SANDBOX_LOCAL_ROOT: sandboxDir,
+					},
+					stdout: "pipe",
+					stderr: "ignore",
+				},
+			);
+			const lines = (await new Response(child.stdout).text()).split("\n").filter(Boolean).map(line => JSON.parse(line) as { prompt?: string; end?: string; isError?: boolean });
+			await child.exited;
+			return {
+				prompts: lines.flatMap(line => (line.prompt === undefined ? [] : [line.prompt])),
+				ends: lines.flatMap(line => (line.end === undefined ? [] : [{ id: line.end, isError: line.isError }])),
+				hostDir,
+				sandboxDir,
+			};
+		};
+		const native = await drive(false);
+		const shadow = await drive(true);
+		expect(native.prompts).toEqual(["Allow tool: bash\nCommand: touch approve-me", "Allow tool: bash\nCommand: touch deny-me"]);
+		expect(shadow.prompts).toEqual(native.prompts);
+		expect(shadow.ends).toEqual([
+			{ id: "call_0", isError: false },
+			{ id: "call_1", isError: true },
+		]);
+		expect(await fs.readdir(shadow.sandboxDir)).toEqual(expect.arrayContaining(["approve-me"]));
+		expect(await fs.readdir(shadow.sandboxDir)).not.toContain("deny-me");
+	}, 180_000);
+
 	test("a host copy that is not empty at start refuses bash and the file tools", async () => {
 		const hostDir = await freshHostDir();
 		await fs.writeFile(path.join(hostDir, "stray.txt"), "x");
