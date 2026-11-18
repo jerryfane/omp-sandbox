@@ -46,8 +46,12 @@ const O_WRITE = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | con
  * command dies of a signal the init writes the signal number to fd 3, a pipe
  * only it holds (the command's copy is closed before exec). It prints
  * nothing of its own, except when bash cannot be started at all.
+ *
+ * Python ignores SIGPIPE and SIGXFSZ at startup, and exec keeps an ignored
+ * disposition, so the child resets every signal to its default before exec:
+ * the command must see the same signals it would without the init.
  */
-const NAMESPACE_INIT = `import os, sys
+const NAMESPACE_INIT = `import os, signal, sys
 def report(text):
     try:
         os.write(3, text)
@@ -55,6 +59,11 @@ def report(text):
         pass
 pid = os.fork()
 if pid == 0:
+    for number in signal.valid_signals():
+        try:
+            signal.signal(number, signal.SIG_DFL)
+        except (OSError, ValueError):
+            pass
     try:
         os.close(3)
     except OSError:

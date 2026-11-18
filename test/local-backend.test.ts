@@ -81,9 +81,14 @@ await probe?.close();
 if (fullSupported) modes.push({ containment: "full" as const });
 else console.warn("omp-sandbox: no pid namespace here (unshare failed); 'full' containment tests are skipped");
 
-// Root can always create a pid namespace, so there "full" being unavailable is
-// a LocalBackend bug, not a host limit, and must fail instead of skipping.
-test.if(process.getuid?.() === 0)("root gets full containment", () => {
+// Whether this host can create a pid namespace at all, checked without
+// LocalBackend's init. Where it can, "full" being unavailable is a
+// LocalBackend bug (a broken init), not a host limit, and must fail instead
+// of silently skipping the full-mode tests.
+const unshareArgs = process.getuid?.() === 0 ? [] : ["--user", "--map-root-user"];
+const hostCanUnshare =
+	Bun.spawnSync(["unshare", ...unshareArgs, "--pid", "--fork", "--kill-child", "--", "true"]).exitCode === 0;
+test.if(hostCanUnshare)("full containment is available wherever the host can create a pid namespace", () => {
 	expect(fullSupported).toBe(true);
 });
 
@@ -208,6 +213,18 @@ describe.each(modes)("exec, containment $containment", ({ containment }) => {
 		expect(result.signal).toBeNull();
 	});
 
+	test("the command sees default signal dispositions (SIGPIPE ends it)", async () => {
+		const raised = await local.exec("kill -PIPE $$; echo survived", { cwd: local.root });
+		expect(raised.signal).toBe("SIGPIPE");
+		expect(raised.exitCode).toBeNull();
+		expect(raised.stdout).toBe("");
+
+		const pipe = await local.exec("set -o pipefail; yes | head -n 1", { cwd: local.root });
+		expect(pipe.stdout).toBe("y\n");
+		expect(pipe.exitCode).toBe(141); // yes died of SIGPIPE; the pipeline reports 128+13
+		expect(pipe.stderr).toBe("");
+	});
+
 	test("the command cannot reach the backend's status channel", async () => {
 		// fd 3 carries the namespace init's report in full mode; the command's
 		// copy is closed, so it cannot fake a signal death.
@@ -232,6 +249,9 @@ async function listRecursiveUnprivileged(root: string): Promise<unknown> {
 	const fixture = path.join(import.meta.dir, "fixtures/list-recursive.ts");
 	let argv = [process.execPath, fixture, root];
 	let env: Record<string, string> = { PATH: "/usr/bin:/bin", HOME: scratch };
+	// The fixture runs from the scratch dir, never the checkout, which the
+	// unprivileged user may not be able to enter.
+	let cwd = scratch;
 	if (process.getuid?.() === 0) {
 		const code = path.join(scratch, "code");
 		await fs.mkdir(path.join(code, "src"), { recursive: true });
@@ -243,8 +263,9 @@ async function listRecursiveUnprivileged(root: string): Promise<unknown> {
 		expect(Bun.spawnSync(["chown", "-R", "65534:65534", code, root]).exitCode).toBe(0);
 		argv = ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--", process.execPath, path.join(code, "test/fixtures/list-recursive.ts"), root];
 		env = { PATH: "/usr/bin:/bin", HOME: code, TMPDIR: code };
+		cwd = code;
 	}
-	const child = Bun.spawn(argv, { env, stdout: "pipe", stderr: "pipe" });
+	const child = Bun.spawn(argv, { cwd, env, stdout: "pipe", stderr: "pipe" });
 	const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
 	if (code !== 0) throw new Error(`fixture exited ${code}: ${err}`);
 	return JSON.parse(out);
