@@ -6,7 +6,9 @@
  *
  * Every path a Backend method takes is a sandbox path: an absolute POSIX path
  * inside the sandbox's own filesystem. Translating the seat's host paths to
- * sandbox paths is the tool layer's job, not the backend's.
+ * sandbox paths is the tool layer's job, not the backend's. No method may
+ * ever read, write, list or stat anything outside the sandbox, whatever
+ * symlinks or concurrent renames the sandbox contains.
  */
 
 export type OutputStream = "stdout" | "stderr";
@@ -19,9 +21,13 @@ export interface ExecOptions {
 	 * environment, never the host's, so host secrets cannot leak in.
 	 */
 	env?: Record<string, string>;
-	/** Kill the command (and everything it started) after this many ms. */
+	/**
+	 * Kill the command after this many ms. A kill reaches every process the
+	 * command started, including ones that moved to another session or
+	 * process group (`setsid`). See Backend.containment for the guarantee.
+	 */
 	timeoutMs?: number;
-	/** Aborting kills the command (and everything it started). */
+	/** Aborting kills the command the same way a timeout does. */
 	signal?: AbortSignal;
 	/** Receives output as it arrives, in arrival order. */
 	onOutput?: (chunk: string, stream: OutputStream) => void;
@@ -75,15 +81,36 @@ export interface Backend {
 	readonly name: string;
 	/** Absolute sandbox path of the workspace root. */
 	readonly root: string;
-	/** Run a shell command (`bash -c <command>`) in the sandbox. */
+	/**
+	 * How exec contains what a command starts. "full": every descendant is
+	 * killed on timeout or abort, and processes still running when the
+	 * command's shell exits are killed then. "process-tree": the kill reaches
+	 * every descendant still linked to the command, but one whose parent has
+	 * already exited, and anything left running after the shell exits,
+	 * survives.
+	 */
+	readonly containment: "full" | "process-tree";
+	/**
+	 * Run a shell command (`bash -c <command>`) in the sandbox. The command's
+	 * own exit code is reported; `signal` is set only when the backend killed
+	 * it (timeout or abort).
+	 */
 	exec(command: string, options: ExecOptions): Promise<ExecResult>;
-	/** Read a whole file. Rejects with a BackendError("ENOENT") when missing. */
+	/** Read a whole regular file. Rejects with BackendError("ENOENT") when missing. */
 	readFile(path: string): Promise<Uint8Array>;
-	/** Write a whole file, creating parent directories as needed. */
+	/**
+	 * Write a whole regular file, creating parent directories as needed. With
+	 * `mode` the file gets that mode; without it an existing file keeps its
+	 * mode and a new one gets the default.
+	 */
 	writeFile(path: string, data: Uint8Array | string, options?: { mode?: number }): Promise<void>;
 	/** Stat without following a final symlink; null when the path does not exist. */
 	stat(path: string): Promise<FileStat | null>;
-	/** List a directory, sorted by path. */
+	/**
+	 * List a directory, sorted by full path in byte order (C collation), so a
+	 * `limit` keeps the sorted prefix. Symlinked directories are listed, never
+	 * entered.
+	 */
 	list(path: string, options?: ListOptions): Promise<ListResult>;
 	/** Release the sandbox connection. The sandbox itself is not destroyed. */
 	close(): Promise<void>;
@@ -91,7 +118,18 @@ export interface Backend {
 
 export const DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 
-export type BackendErrorCode = "ENOENT" | "EISDIR" | "ENOTDIR" | "OUTSIDE_ROOT" | "INVALID_PATH";
+export type BackendErrorCode =
+	| "ENOENT"
+	| "EISDIR"
+	| "ENOTDIR"
+	/** The path is lexically outside the sandbox root. */
+	| "OUTSIDE_ROOT"
+	/** The path is not absolute or contains a NUL byte. */
+	| "INVALID_PATH"
+	/** The path goes through a symlink this backend will not follow. */
+	| "SYMLINK"
+	/** The path names a FIFO, socket or device, not a regular file. */
+	| "NOT_REGULAR";
 
 export class BackendError extends Error {
 	readonly code: BackendErrorCode;

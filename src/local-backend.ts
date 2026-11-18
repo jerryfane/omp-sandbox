@@ -1,10 +1,12 @@
-import { spawn } from "node:child_process";
-import type { Stats } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { constants, readdirSync, readFileSync, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import * as path from "node:path";
 import {
 	type Backend,
 	BackendError,
+	type BackendErrorCode,
 	DEFAULT_MAX_OUTPUT_BYTES,
 	type ExecOptions,
 	type ExecResult,
@@ -22,47 +24,84 @@ const BASE_ENV: Readonly<Record<string, string>> = {
 };
 
 /**
- * How long to keep reading after the shell exits. A command that starts a
- * background process (`sleep 99 &`) leaves our pipes open; past this grace
- * period we stop reading instead of waiting for it, the way a remote sandbox
- * would leave it running in the VM.
+ * In process-tree mode, how long to keep reading after the shell exits. A
+ * command that leaves a background process running (`sleep 99 &`) keeps our
+ * pipes open; past this grace period we stop reading instead of waiting.
  */
 const EXIT_DRAIN_MS = 250;
 
+const O_DIR = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+const O_READ = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const O_WRITE = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
 /**
- * A test stand-in for a sandbox: the "sandbox" is a directory on this host and
- * commands run as local subprocesses with that directory as their world.
+ * The pid-namespace "init": runs the command as its child (so the command is
+ * not PID 1 and keeps normal signal behaviour) and exits with its status. When
+ * it exits, the kernel kills everything left in the namespace.
+ */
+const NAMESPACE_INIT = 'bash -c "$1" omp-sandbox; status=$?; exit "$status"';
+
+/** A sandbox path below `dir`, resolved through an open directory descriptor. */
+function at(dirFd: number, name: string): string {
+	return `/proc/self/fd/${dirFd}/${name}`;
+}
+
+export interface LocalBackendOptions {
+	/**
+	 * Force a containment mode. Default: "full" when this host can create a
+	 * pid namespace (`unshare`), otherwise "process-tree".
+	 */
+	containment?: "full" | "process-tree";
+}
+
+/**
+ * A test stand-in for a sandbox: a directory on this host is the sandbox.
  *
- * File operations are confined to the root (symlinks included), because
- * outside the root is the host, which is exactly what tests must prove the
- * tools never touch. Commands are NOT confined: `exec` is a host subprocess
- * and can read anything the current user can. LocalBackend is for tests, not
- * for isolation.
+ * File operations are confined to that directory. Every path is resolved one
+ * component at a time from an open descriptor of the root, with O_NOFOLLOW,
+ * so no symlink is ever followed and a concurrent rename cannot redirect an
+ * operation outside the root. A path through a symlink fails with
+ * BackendError("SYMLINK"), even one that stays inside the root.
+ *
+ * Commands are NOT confined: `exec` runs a host subprocess that can read
+ * anything the current user can. With containment "full" it runs in its own
+ * pid namespace. LocalBackend is for tests, not for isolation. Linux only.
  */
 export class LocalBackend implements Backend {
 	readonly name = "local";
 	readonly root: string;
+	readonly containment: "full" | "process-tree";
+	readonly #rootDir: FileHandle;
 
-	private constructor(root: string) {
+	private constructor(root: string, rootDir: FileHandle, containment: "full" | "process-tree") {
 		this.root = root;
+		this.#rootDir = rootDir;
+		this.containment = containment;
 	}
 
 	/** `root` must be an existing directory; its real path becomes the sandbox root. */
-	static async create(root: string): Promise<LocalBackend> {
+	static async create(root: string, options: LocalBackendOptions = {}): Promise<LocalBackend> {
 		const real = await fs.realpath(root);
-		const info = await fs.stat(real);
-		if (!info.isDirectory()) {
-			throw new BackendError("ENOTDIR", root, `local backend root is not a directory: ${root}`);
+		let rootDir: FileHandle;
+		try {
+			rootDir = await fs.open(real, O_DIR);
+		} catch (error) {
+			throw mapFsError(error, root);
 		}
-		return new LocalBackend(real);
+		const supported = canCreatePidNamespace();
+		const containment = options.containment ?? (supported ? "full" : "process-tree");
+		if (containment === "full" && !supported) {
+			await rootDir.close();
+			throw new Error("containment 'full' needs a pid namespace, and unshare cannot create one here");
+		}
+		return new LocalBackend(real, rootDir, containment);
 	}
 
 	async exec(command: string, options: ExecOptions): Promise<ExecResult> {
-		const cwd = await this.realInside(options.cwd);
-		const info = await fs.stat(cwd).catch(() => null);
-		if (!info?.isDirectory()) {
-			throw new BackendError("ENOTDIR", options.cwd, `cwd is not a directory: ${options.cwd}`);
-		}
+		// Validate the cwd (exists, a directory, inside, no symlinks); the
+		// command itself is a host process and is not confined to it.
+		await (await this.#openDir(this.#components(options.cwd), options.cwd, false)).close();
+		const cwd = normalizeAbsolute(options.cwd);
 		const limit = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 		const result: ExecResult = {
 			exitCode: null,
@@ -78,19 +117,18 @@ export class LocalBackend implements Backend {
 			return result;
 		}
 
-		const child = spawn("bash", ["-c", command], {
+		const [file, args] =
+			this.containment === "full"
+				? (["unshare", [...namespaceFlags(), "--", "bash", "-c", NAMESPACE_INIT, "omp-sandbox-init", command]] as const)
+				: (["bash", ["-c", command]] as const);
+		const child = spawn(file, args, {
 			cwd,
 			env: { ...BASE_ENV, HOME: this.root, ...options.env },
-			detached: true, // own process group, so a kill reaches every descendant
+			detached: true, // own process group
 			stdio: ["ignore", "pipe", "pipe"],
 		});
-		const killGroup = () => {
-			if (child.pid === undefined) return;
-			try {
-				process.kill(-child.pid, "SIGKILL");
-			} catch {
-				// already gone
-			}
+		const kill = () => {
+			if (child.pid !== undefined) killTree(child.pid);
 		};
 
 		const capture = (stream: OutputStream) => {
@@ -121,11 +159,11 @@ export class LocalBackend implements Backend {
 				? undefined
 				: setTimeout(() => {
 						result.timedOut = true;
-						killGroup();
+						kill();
 					}, options.timeoutMs);
 		const onAbort = () => {
 			result.aborted = true;
-			killGroup();
+			kill();
 		};
 		options.signal?.addEventListener("abort", onAbort, { once: true });
 
@@ -155,100 +193,249 @@ export class LocalBackend implements Backend {
 	}
 
 	async readFile(file: string): Promise<Uint8Array> {
-		const real = await this.realInside(file);
+		const parts = this.#components(file);
+		const name = parts.at(-1);
+		if (name === undefined) throw new BackendError("EISDIR", file, `is a directory: ${file}`);
+		const dir = await this.#openDir(parts.slice(0, -1), file, false);
 		try {
-			return new Uint8Array(await fs.readFile(real));
-		} catch (error) {
-			throw mapFsError(error, file);
+			const handle = await fs.open(at(dir.fd, name), O_READ).catch((error: unknown) => {
+				throw mapFsError(error, file);
+			});
+			try {
+				requireRegular(await handle.stat(), file);
+				return new Uint8Array(await handle.readFile());
+			} finally {
+				await handle.close();
+			}
+		} finally {
+			await dir.close();
 		}
 	}
 
 	async writeFile(file: string, data: Uint8Array | string, options?: { mode?: number }): Promise<void> {
-		const target = await this.realInside(file);
+		const parts = this.#components(file);
+		const name = parts.at(-1);
+		if (name === undefined) throw new BackendError("EISDIR", file, `is a directory: ${file}`);
+		const dir = await this.#openDir(parts.slice(0, -1), file, true);
 		try {
-			await fs.mkdir(path.dirname(target), { recursive: true });
-			// Created directories must still be inside: a symlinked parent could
-			// have redirected mkdir, so check again before writing.
-			await this.realInside(file);
-			await fs.writeFile(target, data, options?.mode === undefined ? undefined : { mode: options.mode });
-		} catch (error) {
-			throw mapFsError(error, file);
+			const handle = await fs.open(at(dir.fd, name), O_WRITE, options?.mode ?? 0o666).catch((error: unknown) => {
+				throw mapFsError(error, file);
+			});
+			try {
+				requireRegular(await handle.stat(), file);
+				await handle.writeFile(data);
+				if (options?.mode !== undefined) await handle.chmod(options.mode);
+			} finally {
+				await handle.close();
+			}
+		} finally {
+			await dir.close();
 		}
 	}
 
 	async stat(file: string): Promise<FileStat | null> {
-		const target = await this.realParentInside(file);
+		const parts = this.#components(file);
+		const name = parts.at(-1);
+		if (name === undefined) return toStat(this.root, await this.#rootDir.stat());
+		let dir: FileHandle;
 		try {
-			return toStat(file, await fs.lstat(target));
+			dir = await this.#openDir(parts.slice(0, -1), file, false);
 		} catch (error) {
-			if (isCode(error, "ENOENT") || isCode(error, "ENOTDIR")) return null;
+			if (error instanceof BackendError && (error.code === "ENOENT" || error.code === "ENOTDIR")) return null;
+			throw error;
+		}
+		try {
+			return toStat(normalizeAbsolute(file), await fs.lstat(at(dir.fd, name)));
+		} catch (error) {
+			if (isCode(error, "ENOENT")) return null;
 			throw mapFsError(error, file);
+		} finally {
+			await dir.close();
 		}
 	}
 
 	async list(dir: string, options: ListOptions = {}): Promise<ListResult> {
-		const realDir = await this.realInside(dir);
-		const limit = options.limit ?? Number.POSITIVE_INFINITY;
+		const handle = await this.#openDir(this.#components(dir), dir, false);
 		const entries: FileStat[] = [];
-		let truncated = false;
-
-		const walk = async (sandboxDir: string, hostDir: string): Promise<void> => {
+		// LocalBackend reads the whole requested tree and then sorts, so `limit`
+		// bounds the result, not the work.
+		const walk = async (dirFd: number, sandboxDir: string): Promise<void> => {
 			let names: string[];
 			try {
-				names = (await fs.readdir(hostDir)).sort();
+				names = await fs.readdir(at(dirFd, "."));
 			} catch (error) {
 				throw mapFsError(error, sandboxDir);
 			}
 			for (const name of names) {
-				if (entries.length >= limit) {
-					truncated = true;
-					return;
-				}
 				const sandboxPath = path.posix.join(sandboxDir, name);
-				const hostPath = path.join(hostDir, name);
-				const info = toStat(sandboxPath, await fs.lstat(hostPath));
+				let info: FileStat;
+				try {
+					info = toStat(sandboxPath, await fs.lstat(at(dirFd, name)));
+				} catch (error) {
+					if (isCode(error, "ENOENT")) continue; // removed while listing
+					throw mapFsError(error, sandboxPath);
+				}
 				entries.push(info);
-				// Never follow a symlinked directory: it may point outside the root.
-				if (options.recursive && info.type === "dir") {
-					await walk(sandboxPath, hostPath);
-					if (truncated) return;
+				if (!options.recursive || info.type !== "dir") continue;
+				// Re-opened with O_NOFOLLOW: if it became a symlink since lstat,
+				// it is not entered.
+				const child = await fs.open(at(dirFd, name), O_DIR).catch(() => undefined);
+				if (child === undefined) continue;
+				try {
+					await walk(child.fd, sandboxPath);
+				} finally {
+					await child.close();
 				}
 			}
 		};
-		await walk(normalizeAbsolute(dir), realDir);
-		return { entries, truncated };
-	}
-
-	async close(): Promise<void> {}
-
-	/** Resolve `file` (following symlinks as far as it exists) and require it inside the root. */
-	private async realInside(file: string): Promise<string> {
-		const lexical = this.lexicalInside(file);
-		const real = await realpathOfExisting(lexical);
-		if (!isWithin(this.root, real)) {
-			throw new BackendError("OUTSIDE_ROOT", file, `path resolves outside the sandbox root: ${file}`);
+		try {
+			await walk(handle.fd, normalizeAbsolute(dir));
+		} finally {
+			await handle.close();
 		}
-		return real;
+		entries.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
+		const limit = options.limit ?? Number.POSITIVE_INFINITY;
+		return entries.length > limit ? { entries: entries.slice(0, limit), truncated: true } : { entries, truncated: false };
 	}
 
-	/** Like realInside, but the final component itself is not followed (lstat semantics). */
-	private async realParentInside(file: string): Promise<string> {
-		const lexical = this.lexicalInside(file);
-		if (lexical === this.root) return lexical;
-		const parent = await realpathOfExisting(path.dirname(lexical));
-		if (!isWithin(this.root, parent)) {
-			throw new BackendError("OUTSIDE_ROOT", file, `path resolves outside the sandbox root: ${file}`);
-		}
-		return path.join(parent, path.basename(lexical));
+	async close(): Promise<void> {
+		await this.#rootDir.close();
 	}
 
-	private lexicalInside(file: string): string {
+	/** The components of `file` below the root; [] for the root itself. */
+	#components(file: string): string[] {
 		const normalized = normalizeAbsolute(file);
-		if (!isWithin(this.root, normalized)) {
+		const prefix = this.root === "/" ? "/" : `${this.root}/`;
+		if (normalized === this.root) return [];
+		if (!normalized.startsWith(prefix)) {
 			throw new BackendError("OUTSIDE_ROOT", file, `path is outside the sandbox root: ${file}`);
 		}
-		return normalized;
+		return normalized.slice(prefix.length).split("/");
 	}
+
+	/**
+	 * Open the directory `parts` below the root, one component at a time with
+	 * O_NOFOLLOW, creating missing ones when `create` is set. The caller owns
+	 * the returned handle.
+	 */
+	async #openDir(parts: readonly string[], file: string, create: boolean): Promise<FileHandle> {
+		let current = await fs.open(at(this.#rootDir.fd, "."), O_DIR);
+		try {
+			for (const name of parts) {
+				const next = await openChildDir(current.fd, name, file, create);
+				await current.close();
+				current = next;
+			}
+			return current;
+		} catch (error) {
+			await current.close();
+			throw error;
+		}
+	}
+}
+
+async function openChildDir(dirFd: number, name: string, file: string, create: boolean): Promise<FileHandle> {
+	try {
+		return await fs.open(at(dirFd, name), O_DIR);
+	} catch (error) {
+		if (create && isCode(error, "ENOENT")) {
+			await fs.mkdir(at(dirFd, name)).catch((mkdirError: unknown) => {
+				if (!isCode(mkdirError, "EEXIST")) throw mapFsError(mkdirError, file);
+			});
+			return await fs.open(at(dirFd, name), O_DIR).catch(async (reopenError: unknown) => {
+				throw await classifyNotDir(reopenError, dirFd, name, file);
+			});
+		}
+		throw await classifyNotDir(error, dirFd, name, file);
+	}
+}
+
+/**
+ * O_DIRECTORY|O_NOFOLLOW fails with ENOTDIR for both a file and a symlink;
+ * lstat tells them apart. Only the error code depends on this, not safety.
+ */
+async function classifyNotDir(error: unknown, dirFd: number, name: string, file: string): Promise<unknown> {
+	if (!isCode(error, "ENOTDIR") && !isCode(error, "ELOOP")) return mapFsError(error, file);
+	const info = await fs.lstat(at(dirFd, name)).catch(() => undefined);
+	if (info?.isSymbolicLink()) return new BackendError("SYMLINK", file, `path goes through a symlink: ${file}`);
+	return new BackendError("ENOTDIR", file, `not a directory: ${file}`);
+}
+
+function requireRegular(info: Stats, file: string): void {
+	if (info.isDirectory()) throw new BackendError("EISDIR", file, `is a directory: ${file}`);
+	if (!info.isFile()) throw new BackendError("NOT_REGULAR", file, `not a regular file: ${file}`);
+}
+
+let pidNamespaceSupport: boolean | undefined;
+
+/** Whether `unshare` can create a pid namespace here (probed once per process). */
+function canCreatePidNamespace(): boolean {
+	pidNamespaceSupport ??= spawnSync("unshare", [...namespaceFlags(), "--", "true"], { stdio: "ignore" }).status === 0;
+	return pidNamespaceSupport;
+}
+
+function namespaceFlags(): string[] {
+	const user = process.getuid?.() === 0 ? [] : ["--user", "--map-root-user"];
+	return [...user, "--pid", "--fork", "--kill-child"];
+}
+
+/**
+ * SIGKILL `rootPid`, every process descended from it, and its process group.
+ * Descendants are frozen with SIGSTOP first, round by round until no new one
+ * appears, so none can fork or exit (and reparent its children) mid-kill. A
+ * descendant whose parent exited before this runs is no longer linked to
+ * rootPid and is missed; containment "full" covers that with the namespace.
+ */
+function killTree(rootPid: number): void {
+	const frozen = new Set<number>();
+	for (let round = 0; round < 16; round++) {
+		let added = false;
+		for (const pid of [rootPid, ...descendantsOf(rootPid)]) {
+			if (frozen.has(pid)) continue;
+			signal(pid, "SIGSTOP");
+			frozen.add(pid);
+			added = true;
+		}
+		if (!added) break;
+	}
+	for (const pid of frozen) signal(pid, "SIGKILL");
+	signal(-rootPid, "SIGKILL");
+}
+
+function signal(pid: number, name: NodeJS.Signals): void {
+	try {
+		process.kill(pid, name);
+	} catch {
+		// already gone
+	}
+}
+
+/** Every live process below `rootPid` in the parent tree, from /proc. */
+function descendantsOf(rootPid: number): number[] {
+	const children = new Map<number, number[]>();
+	for (const entry of readdirSync("/proc")) {
+		const pid = Number(entry);
+		if (!Number.isInteger(pid)) continue;
+		let stat: string;
+		try {
+			stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		} catch {
+			continue; // exited meanwhile
+		}
+		// "pid (comm) state ppid ..." — comm may contain spaces and parentheses.
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		const ppid = Number(fields[1]);
+		const siblings = children.get(ppid);
+		if (siblings === undefined) children.set(ppid, [pid]);
+		else siblings.push(pid);
+	}
+	const found: number[] = [];
+	const queue = [...(children.get(rootPid) ?? [])];
+	for (let pid = queue.shift(); pid !== undefined; pid = queue.shift()) {
+		found.push(pid);
+		queue.push(...(children.get(pid) ?? []));
+	}
+	return found;
 }
 
 function normalizeAbsolute(file: string): string {
@@ -257,28 +444,6 @@ function normalizeAbsolute(file: string): string {
 	}
 	const normalized = path.posix.normalize(file);
 	return normalized.length > 1 && normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
-}
-
-function isWithin(root: string, candidate: string): boolean {
-	return candidate === root || candidate.startsWith(root.endsWith("/") ? root : `${root}/`);
-}
-
-/** realpath of the longest existing prefix of `file`, with the missing rest appended. */
-async function realpathOfExisting(file: string): Promise<string> {
-	const missing: string[] = [];
-	let current = file;
-	for (;;) {
-		try {
-			const real = await fs.realpath(current);
-			return missing.length === 0 ? real : path.join(real, ...missing.reverse());
-		} catch (error) {
-			if (!isCode(error, "ENOENT") && !isCode(error, "ENOTDIR")) throw error;
-			const parent = path.dirname(current);
-			if (parent === current) throw error;
-			missing.push(path.basename(current));
-			current = parent;
-		}
-	}
 }
 
 function toStat(sandboxPath: string, info: Stats): FileStat {
@@ -293,10 +458,17 @@ function isCode(error: unknown, code: string): boolean {
 	return typeof error === "object" && error !== null && "code" in error && error.code === code;
 }
 
+const FS_CODES: Readonly<Record<string, BackendErrorCode>> = {
+	ENOENT: "ENOENT",
+	EISDIR: "EISDIR",
+	ENOTDIR: "ENOTDIR",
+	ELOOP: "SYMLINK",
+	ENXIO: "NOT_REGULAR", // a FIFO opened for writing with no reader
+};
+
 function mapFsError(error: unknown, file: string): unknown {
 	if (error instanceof BackendError) return error;
-	if (isCode(error, "ENOENT")) return new BackendError("ENOENT", file, `no such file: ${file}`);
-	if (isCode(error, "EISDIR")) return new BackendError("EISDIR", file, `is a directory: ${file}`);
-	if (isCode(error, "ENOTDIR")) return new BackendError("ENOTDIR", file, `not a directory: ${file}`);
-	return error;
+	const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+	const mapped = FS_CODES[code];
+	return mapped === undefined ? error : new BackendError(mapped, file, `${mapped}: ${file}`);
 }

@@ -14,17 +14,24 @@ A backend implements `Backend` in [`src/backend.ts`](src/backend.ts):
 
 | Method | Does |
 |---|---|
-| `exec(command, {cwd, env, timeoutMs, signal, onOutput, maxOutputBytes})` | runs `bash -c <command>` in the sandbox: streams output, kills the whole process group on timeout or abort, and starts from the backend's own minimal environment (never the host's) |
-| `readFile(path)` / `writeFile(path, data, {mode})` | whole-file read and write; write creates parent directories |
+| `exec(command, {cwd, env, timeoutMs, signal, onOutput, maxOutputBytes})` | runs `bash -c <command>` in the sandbox: streams output, starts from the backend's own minimal environment (never the host's), and on timeout or abort kills every process the command started, including ones that called `setsid` |
+| `readFile(path)` / `writeFile(path, data, {mode})` | whole-file read and write of regular files; write creates parent directories and keeps an existing file's mode unless `mode` is given |
 | `stat(path)` | type, size and mtime without following a final symlink; `null` if missing |
-| `list(path, {recursive, limit})` | sorted directory listing; never follows a symlinked directory |
+| `list(path, {recursive, limit})` | listing sorted by full path in byte order (C collation), so `limit` keeps the sorted prefix; symlinked directories are listed, never entered |
+| `containment` | `"full"`: every descendant is killed on timeout or abort, and leftovers are killed when the command's shell exits. `"process-tree"`: every descendant still linked to the command is killed, but a process whose parent already exited, and anything left running after the shell exits, survives |
 
-Every path a backend takes is an absolute path *inside the sandbox*. Translating the agent's host paths to sandbox paths is the tool layer's job.
+Every path a backend takes is an absolute path *inside the sandbox*. Translating the agent's host paths to sandbox paths is the tool layer's job. No backend method may ever touch anything outside the sandbox, whatever symlinks or concurrent renames it contains.
 
 ### `LocalBackend` (tests only)
-[`src/local-backend.ts`](src/local-backend.ts) treats a directory on this host as the sandbox:
-- **File operations are confined to that directory**, symlinks included. Tests use this to prove a tool never touches a host file.
-- **`exec` is a plain host subprocess.** It isolates nothing; it exists to exercise the tools without a VM.
+[`src/local-backend.ts`](src/local-backend.ts) treats a directory on this host as the sandbox. Linux only.
+- **File operations are confined to that directory.**
+  - Every path is resolved one component at a time from an open descriptor of the root, with `O_NOFOLLOW`, through `/proc/self/fd/<n>/<name>`.
+  - No symlink is ever followed, even one that stays inside: such a path fails with `SYMLINK`.
+  - A concurrent rename cannot redirect an operation, because each step uses the directory already opened, not a name looked up again.
+  - Tests use this to prove a tool never touches a host file.
+- **`exec` is a host subprocess and is not confined.** It exists to exercise the tools without a VM.
+  - **Containment `"full"`** runs each command in its own pid namespace (`unshare --pid --fork --kill-child`). It is picked when `unshare` works: as root, or as a user allowed to create user namespaces.
+  - **Otherwise `"process-tree"`:** the kill freezes the descendant tree with `SIGSTOP` round by round, then kills it. The command is not PID 1, so `$$` is 2 and signals behave normally.
 
 ### Planned
 - `gitmoot workspace` (the first real backend), built against the CLI agreed on #2678.
