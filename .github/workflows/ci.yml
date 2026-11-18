@@ -8,7 +8,11 @@ permissions:
 jobs:
   test:
     name: typecheck / test
-    runs-on: ubuntu-latest
+    # Private-repo Actions minutes are unavailable (owner: no new spend), so CI
+    # runs on the hetzner2 runner (fleetup #105). Before this repo goes public,
+    # switch back to ubuntu-latest and have fleetup remove the runner: pull
+    # requests from forks must never run on hetzner2.
+    runs-on: [self-hosted, linux, x64, h2-ci]
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
