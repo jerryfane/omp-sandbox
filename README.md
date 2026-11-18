@@ -30,8 +30,8 @@ Every path a backend takes is an absolute path *inside the sandbox*. Translating
   - A concurrent rename cannot redirect an operation, because each step uses the directory already opened, not a name looked up again.
   - Tests use this to prove a tool never touches a host file.
 - **`exec` is a host subprocess and is not confined.** It exists to exercise the tools without a VM.
-  - **Containment `"full"`** runs each command in its own pid namespace (`unshare --pid --fork --kill-child`). It is picked when `unshare` works: as root, or as a user allowed to create user namespaces.
-  - **Otherwise `"process-tree"`:** the kill freezes the descendant tree with `SIGSTOP` round by round, then kills it. The command is not PID 1, so `$$` is 2 and signals behave normally.
+  - **Containment `"full"`** runs each command in its own pid namespace (`unshare --pid --fork --kill-child`), under a small init. The command itself is not PID 1, so `$$` is 2 and signals behave normally. It is picked when `unshare` works: as root, or as a user allowed to create user namespaces.
+  - **Otherwise `"process-tree"`:** the kill freezes the descendant tree with `SIGSTOP` round by round, then kills it.
 
 ### Planned
 - `gitmoot workspace` (the first real backend), built against the CLI agreed on #2678.
