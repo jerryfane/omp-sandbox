@@ -63,7 +63,7 @@ async function freshSandbox(seed: Record<string, string> = {}): Promise<string> 
 
 /** Runs omp once with the given script of tool calls, in a fresh host copy and sandbox; returns what the session did. */
 async function runOmp(
-	script: { name: string; arguments: Record<string, unknown> }[],
+	script: (ScriptedCall | ScriptedCall[])[],
 	extraEnv: Record<string, string> = {},
 	seed: Record<string, string> = {},
 ): Promise<Run> {
@@ -135,7 +135,12 @@ async function runOmp(
 	return run;
 }
 
-function bash(args: Record<string, unknown>): { name: string; arguments: Record<string, unknown> } {
+interface ScriptedCall {
+	name: string;
+	arguments: Record<string, unknown>;
+}
+
+function bash(args: Record<string, unknown>): ScriptedCall {
 	return { name: "bash", arguments: args };
 }
 
@@ -252,10 +257,10 @@ describe.if(ompInstalled)("installed omp with the extension (LocalBackend)", () 
 		expect((await fs.readdir(run.hostDir)).sort()).toEqual(["allowed-marker", "sub"]);
 	}, 120_000);
 
-	test("the shadow bash offers the model the same parameters as omp's native bash", async () => {
-		// The extension mirrors the schema by hand (it cannot read it at load
-		// time). A provider records the bash schema omp sends the model, once
-		// with native bash and once with the extension loaded.
+	test("the shadows offer the model the same tools as omp's natives", async () => {
+		// bash's schema is mirrored by hand; the file tools' come from omp's own
+		// classes. A provider records the tools omp sends the model, once with
+		// the natives and once with the extension loaded.
 		const recorder = path.join(scratch, "schema-recorder.ts");
 		await fs.writeFile(
 			recorder,
@@ -264,14 +269,14 @@ const model = { id: "r1", name: "R", reasoning: false, input: ["text"], cost: { 
 export default function (pi) {
 	pi.registerProvider("recorder", { baseUrl: "https://recorder.invalid/", apiKey: "unused", api: "recorder-api", models: [model],
 		streamSimple(_model, context) {
-			const bash = (context.tools ?? []).find(t => t.name === "bash");
-			appendFileSync(process.env.SCHEMA_OUT, JSON.stringify(bash?.parameters ?? null) + "\\n");
+			const tools = Object.fromEntries((context.tools ?? []).filter(t => ["bash", "read", "write", "edit", "grep", "glob", "find", "ast_grep"].includes(t.name)).map(t => [t.name, { description: t.description, parameters: t.parameters }]));
+			appendFileSync(process.env.SCHEMA_OUT, JSON.stringify(tools) + "\\n");
 			throw new Error("schema recorded");
 		} });
 }
 `,
 		);
-		const schemaFor = async (withExtension: boolean): Promise<unknown> => {
+		const schemaFor = async (withExtension: boolean): Promise<Record<string, { description: string; parameters: unknown }>> => {
 			const out = path.join(scratch, `schema-${withExtension}.jsonl`);
 			const extensions = ["--trusted-extension", recorder];
 			if (withExtension) extensions.push("--trusted-extension", path.resolve(import.meta.dir, "../src/extension.ts"));
@@ -295,9 +300,12 @@ export default function (pi) {
 		};
 		const native = await schemaFor(false);
 		const shadow = await schemaFor(true);
-		expect(native).toMatchObject({ type: "object", properties: { command: { type: "string" } } });
-		// Descriptions are prose and may differ; names, types, bounds and requiredness must not.
-		expect(stripDescriptions(shadow)).toEqual(stripDescriptions(native));
+		expect(Object.keys(shadow).sort()).toEqual(Object.keys(native).sort());
+		expect(native.bash?.parameters).toMatchObject({ type: "object", properties: { command: { type: "string" } } });
+		// bash's description is the add-on's own; names, types, bounds and requiredness must match.
+		expect(stripDescriptions(shadow.bash?.parameters)).toEqual(stripDescriptions(native.bash?.parameters));
+		// The file tools are omp's own, descriptions included.
+		for (const name of Object.keys(native).filter(n => n !== "bash")) expect(shadow[name]).toEqual(native[name]);
 	}, 120_000);
 
 	test("omp's own file tools work on the copy, and their changes and bash's meet in the sandbox", async () => {
@@ -418,6 +426,51 @@ export default function (pi) {
 		expect(await fs.readdir(shadow.sandboxDir)).toEqual(expect.arrayContaining(["approve-me"]));
 		expect(await fs.readdir(shadow.sandboxDir)).not.toContain("deny-me");
 	}, 180_000);
+
+	test("in one batch, each call sees what the call before it did", async () => {
+		const call = (name: string, args: Record<string, unknown>) => ({ name, arguments: args });
+		const run = await runOmp([
+			// One assistant message: omp prepares all four calls before running any.
+			[
+				bash({ command: "echo from-bash > made.txt" }),
+				call("read", { path: "made.txt" }),
+				call("write", { path: "w.txt", content: "from-write\n" }),
+				bash({ command: "cat w.txt" }),
+			],
+		]);
+		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
+		for (const id of ["call_0", "call_1", "call_2", "call_3"]) expect(byId.get(id)?.isError).toBe(false);
+		expect(byId.get("call_1")?.text).toContain("from-bash");
+		expect(byId.get("call_3")?.text).toContain("from-write");
+	}, 120_000);
+
+	test("once a sync fails, later calls in the same batch are refused when they run, not only when prepared", async () => {
+		const call = (name: string, args: Record<string, unknown>) => ({ name, arguments: args });
+		const run = await runOmp(
+			[
+				[
+					// Removing the sandbox's root makes this call's own pull afterwards fail.
+					bash({ command: 'root="$PWD"; cd / && rm -rf -- "$root"' }),
+					call("write", { path: "first.txt", content: "must not be written\n" }),
+					call("read", { path: "keep.txt" }),
+					bash({ command: "touch /tmp/omp-sandbox-must-not-run" }),
+				],
+			],
+			{},
+			{ "keep.txt": "k\n" },
+		);
+		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
+		const text = (id: string) => byId.get(id)?.text ?? "";
+		expect(byId.get("call_0")?.isError).toBe(true);
+		expect(text("call_0")).toContain("its changes did not reach the workspace copy");
+		// All prepared before the failure; each refused when it came to run.
+		for (const id of ["call_1", "call_2", "call_3"]) {
+			expect(byId.get(id)?.isError).toBe(true);
+			expect(text(id)).toContain("out of sync");
+		}
+		expect(await fs.readdir(run.hostDir)).not.toContain("first.txt");
+		expect(await Bun.file("/tmp/omp-sandbox-must-not-run").exists()).toBe(false);
+	}, 120_000);
 
 	test("a host copy that is not empty at start refuses bash and the file tools", async () => {
 		const hostDir = await freshHostDir();

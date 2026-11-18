@@ -52,7 +52,7 @@ declare module "@oh-my-pi/pi-coding-agent" {
 	/** omp's session settings (opaque here; only passed back to omp). */
 	export type OmpSettings = object;
 
-	/** The part of omp's ToolSession a file tool's target parser reads. */
+	/** The part of omp's ToolSession a file tool reads for its schema, description and approval. */
 	export interface FileToolSession {
 		cwd: string;
 		settings: OmpSettings;
@@ -60,6 +60,19 @@ declare module "@oh-my-pi/pi-coding-agent" {
 
 	/** A tool's `approvalCacheTargets`: absolute paths, `tree\0<dir>/` for a recursive search, or URLs. */
 	export type TargetParser = (args: unknown) => readonly string[] | undefined;
+
+	/** The members of one of omp's file tools that a shadow forwards. */
+	export interface NativeFileTool {
+		readonly label: string;
+		readonly description: string;
+		/** The tool's schema (an ArkType type); handed back to omp unchanged. */
+		readonly parameters: unknown;
+		readonly loadMode?: "essential" | "discoverable";
+		readonly strict?: boolean;
+		readonly approval?: ToolApprovalDecision | ((args: unknown, ctx?: ApprovalContext) => ToolApprovalDecision);
+		readonly approvalCacheTargets: TargetParser;
+		readonly formatApprovalDetails?: (args: unknown) => string[];
+	}
 
 	/** What omp passes a tool's approval function (AgentToolContext, the fields used here). */
 	export interface ApprovalContext {
@@ -77,9 +90,14 @@ declare module "@oh-my-pi/pi-coding-agent" {
 		name: string;
 		label: string;
 		description: string;
-		parameters: ZodSchema;
+		/** A zod schema (`pi.zod`), or a native tool's own ArkType schema passed through. */
+		parameters: ZodSchema | unknown;
 		/** Extension tools default to "discoverable"; "essential" keeps a tool top-level. */
 		loadMode?: "essential" | "discoverable";
+		/** "exclusive": omp runs the call alone, after every earlier call in the batch finished. */
+		concurrency?: "shared" | "exclusive";
+		/** Registered but not offered until activated (setActiveTools). */
+		defaultInactive?: boolean;
 		/** Approval tier or per-call decision; defaults to "exec". */
 		approval?: ToolApprovalDecision | ((args: unknown, ctx?: ApprovalContext) => ToolApprovalDecision);
 		/** Rows an approval prompt shows under "Allow tool: <name>". */
@@ -151,55 +169,40 @@ declare module "@oh-my-pi/pi-coding-agent/config/settings" {
 	}
 }
 
-// omp's file tools, constructed here only for `approvalCacheTargets`, which reads the session's cwd and settings.
+// omp's file tools; see NativeFileTool for the members used.
 declare module "@oh-my-pi/pi-coding-agent/tools/read" {
-	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
-	export class ReadTool {
-		constructor(session: FileToolSession);
-		readonly approvalCacheTargets: TargetParser;
-	}
+	import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
+	export const ReadTool: new (session: FileToolSession) => NativeFileTool;
 }
 declare module "@oh-my-pi/pi-coding-agent/tools/write" {
-	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
-	export class WriteTool {
-		constructor(session: FileToolSession);
-		readonly approvalCacheTargets: TargetParser;
-	}
+	import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
+	export const WriteTool: new (session: FileToolSession) => NativeFileTool;
 }
 declare module "@oh-my-pi/pi-coding-agent/edit" {
-	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
-	export class EditTool {
-		constructor(session: FileToolSession);
-		readonly approvalCacheTargets: TargetParser;
-	}
+	import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
+	export const EditTool: new (session: FileToolSession) => NativeFileTool;
 }
 declare module "@oh-my-pi/pi-coding-agent/tools/grep" {
-	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
-	export class GrepTool {
-		constructor(session: FileToolSession);
-		readonly approvalCacheTargets: TargetParser;
-	}
+	import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
+	export const GrepTool: new (session: FileToolSession) => NativeFileTool;
 }
 declare module "@oh-my-pi/pi-coding-agent/tools/glob" {
-	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
-	export class GlobTool {
-		constructor(session: FileToolSession);
-		readonly approvalCacheTargets: TargetParser;
-	}
+	import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
+	export const GlobTool: new (session: FileToolSession) => NativeFileTool;
 }
 declare module "@oh-my-pi/pi-coding-agent/tools/jfind/index" {
-	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
-	export class FindTool {
-		constructor(session: FileToolSession);
-		readonly approvalCacheTargets: TargetParser;
-	}
+	import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
+	export const FindTool: new (session: FileToolSession) => NativeFileTool;
 }
 declare module "@oh-my-pi/pi-coding-agent/tools/ast-grep" {
-	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
-	export class AstGrepTool {
-		constructor(session: FileToolSession);
-		readonly approvalCacheTargets: TargetParser;
-	}
+	import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
+	export const AstGrepTool: new (session: FileToolSession) => NativeFileTool;
+}
+
+declare module "@oh-my-pi/pi-coding-agent/tools/index" {
+	import type { FileToolSession } from "@oh-my-pi/pi-coding-agent";
+	/** Which built-in tools a session gets under its settings. */
+	export function resolveBuiltinToolPlan(session: FileToolSession): Promise<{ isAllowed(name: string): boolean }>;
 }
 
 declare module "@oh-my-pi/pi-ai" {

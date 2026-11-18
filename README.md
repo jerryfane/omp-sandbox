@@ -4,7 +4,7 @@ An [omp](https://github.com/can1357/oh-my-pi) add-on that runs an agent's tools 
 
 It re-registers omp's built-in `bash` under the same name and forwards each call to a **backend**: the place where commands run and files live. omp's own file tools work on a host copy of the sandbox's files that the add-on keeps in sync. The agent's session, pane, messages and model calls stay local. Its checkout, builds and tests run in the sandbox.
 
-> **Status: prototype, private.** Steps 1, 2a and 2b of the plan below: the backend interface, a local stand-in backend, the `bash` replacement and the synced file tools. Not yet checked: subagents, the minimizer, interactive approval prompts and sync cost on a large tree (step 3). Do not install this for a live agent yet.
+> **Status: prototype, private.** Steps 1, 2a and 2b of the plan below: the backend interface, a local stand-in backend, the `bash` replacement and the synced file tools. Not yet checked: subagents (`task` is refused), and the sync over a real remote backend (step 3/4). Do not install this for a live agent yet.
 
 ## Why
 Design: gitmoot/gitmoot#2678, option (c). omp's built-in tools run inside the omp process, through the embedded bash engine and in-process file tools. A `shellPath` wrapper cannot move them, so the tools themselves are replaced.
@@ -18,31 +18,41 @@ So omp's background jobs (`async`), auto-backgrounding, timeouts, streaming and 
 
 - **`cwd`** is mapped from the host copy onto the sandbox root (`PathMap`). A `cwd` outside the copy is refused.
 - **Refused:** `pty` and named services (`name`/`ready`). Both would run on this machine.
-- **Approvals:** each call is judged by **omp's own bash approval rules**: `tools.approvalMode`, `tools.approval.bash`, `bash.patterns` allow/prompt/deny, the bash interceptor, and critical-command prompts. They are applied to the command the agent wrote, not the rewritten line. The delegated native call is not gated a second time. The add-on gets these rules by importing omp's `BashTool` (`@oh-my-pi/pi-coding-agent/tools/bash`), whose approval reads only settings.
+- **Approvals:** each call is judged by **omp's own bash approval rules**: `tools.approvalMode`, `tools.approval.bash`, `bash.patterns` allow/prompt/deny, the bash interceptor, and critical-command prompts. They are applied to the command the agent wrote, not the rewritten line, and an interactive prompt shows that command (`formatApprovalDetails`), as native bash's does. The delegated native call is not gated a second time. The add-on gets these rules by importing omp's `BashTool` (`@oh-my-pi/pi-coding-agent/tools/bash`), whose approval reads only settings.
 - **Fail closed:** if the add-on is configured but its backend cannot be set up, omp's bash approval rules or file-tool parsers cannot be loaded, or the host copy is out of sync, `bash` and the file tools refuse every call instead of acting on the host.
 - **Known gap:** omp's background-job notices show the rewritten command line. A real backend keeps it short; for gitmoot it is `gitmoot ws sh …`.
 
 ## How the file tools reach the sandbox
-`read`, `write`, `edit`, `grep`, `glob`, `find` and `ast_grep` are **omp's own tools, unchanged**: same schemas, same approvals, same snapshot tags for `edit`. They run on a **host copy** of the sandbox's workspace ([`src/mirror.ts`](src/mirror.ts)). omp's cwd is that copy.
+`read`, `write`, `edit`, `grep`, `glob`, `find` and `ast_grep` run as **omp's own tools** on a **host copy** of the sandbox's workspace ([`src/mirror.ts`](src/mirror.ts)). omp's cwd is that copy. Each is re-registered as a shadow that takes its schema, description, approval, approval targets and prompt rows from an instance of omp's own tool class ([`src/file-tools.ts`](src/file-tools.ts)). The shadow runs the native tool through `ctx.invokeTool`, so `edit`'s snapshot tags and every output format are omp's. A tool omp's settings do not offer (`find` and `ast_grep` by default) is registered inactive, as it would be natively.
 
 | When | Sync |
 |---|---|
 | omp starts | the copy, which must be an empty directory, is filled from the sandbox |
-| before each file-tool call | sandbox → copy, so a background `bash` job's output is visible |
-| after each file-tool call | copy → sandbox: new, changed and deleted files, with their modes |
-| before each `bash` call | copy → sandbox |
-| after each `bash` call | sandbox → copy |
+| a file tool runs | sandbox → copy, then the tool, then copy → sandbox |
+| `bash` runs | copy → sandbox, then the command, then sandbox → copy |
 
-- **Order:** omp runs every `tool_call` hook of a turn before the first tool, then runs the tools one at a time, each after the previous tool's `tool_result` hook. So within one turn a file tool sees what an earlier `bash` did, and `bash` sees what an earlier `edit` did. The integration test shows both.
-- **Paths outside the copy are refused**, judged by each tool's own parser (its `approvalCacheTargets`, the same reading of the arguments the tool will execute). This covers `edit`'s headers, move targets and grep's `;`-separated paths. Internal and web URLs pass through: they are not workspace files.
-- **Only files and directories are mirrored.** A symlink or special file in the sandbox is not created in the copy, and a symlink created in the copy is refused. `.git` is not mirrored in either direction.
-- **Conflicts stop the add-on.** The mirror never deletes or overwrites a host path it did not write, or one that changed on the host since its last sync. A file changed on both sides, or any other sync failure, breaks the mirror, and every later `bash` and file-tool call is refused with the reason. Nothing is merged.
-- **Change detection:** the backend reports what changed since a token (`Backend.changes`). An unknown token gets a full listing, and the mirror then treats anything it holds that is not listed as deleted. The copy is compared by size, mtime, ctime, inode and mode.
+- **Checked when each call runs.** A model can send several calls in one message, and omp prepares them all (its `tool_call` hooks) before running any. So the health check, the outside-path check and the syncs happen inside each shadow's own execution, not in a hook. All shadows are `exclusive`: omp runs them one at a time, so no two syncs or tool runs interleave. A `tool_call` hook also refuses early, before an approval prompt, but it is not relied on.
+- **Paths outside the copy are refused**, judged by each tool's own parser (its `approvalCacheTargets`, the same reading of the arguments the tool will execute and that omp's approval uses). This covers `edit`'s headers, move targets and grep's `;`-separated paths. Internal and web URLs pass through: they are not workspace files.
+- **Only files and directories are mirrored.** A symlink or special file in the sandbox is not created in the copy, and a symlink created in the copy is refused. `.git` is not mirrored in either direction. Any other name, including the mirror's own temp-file prefix, is an ordinary file.
+- **Conflicts stop the add-on; nothing is merged.**
+  - Before a push, the mirror asks the sandbox what changed since the last sync. A path changed on both sides, or one inside a directory the other side changed, is a conflict and nothing is sent. So a background job's change is never overwritten by an edit made at the same time.
+  - A pull never overwrites or deletes a host file that changed since the last sync.
+  - A pull removes a host directory only when the mirror made it (pulling, or pushing files into it), it is still that directory (same inode), and it is empty. A directory a tool made, or a replacement of the mirror's, stays.
+  - A conflict, or any other sync failure, breaks the mirror. Every later `bash` and file-tool call is refused with the reason, including calls already prepared in the same message.
+- **Change detection:** the backend reports what changed since a token (`Backend.changes`). An unknown token gets a full listing, compared with the mirror's record of the last sync. The copy is compared by size, mtime, ctime, inode and mode.
 
 ## Tools refused with the sandbox
-`eval`, `debug`, `lsp` and `task` are refused at `tool_call` with a reason. Each runs code or a server on this machine with the host's filesystem and environment, and a `task` subagent's tools are not confined either. `ast_edit` is refused too: omp 18.20 reports no paths for it (no `approvalCacheTargets`), so the add-on cannot check that it stays inside the copy. At startup the add-on checks that every file tool it allows has such a parser; if one is missing, it refuses everything.
+`eval`, `debug`, `lsp` and `task` are refused with a reason. Each runs code or a server on this machine with the host's filesystem and environment, and a `task` subagent's tools are not confined either. `ast_edit` is refused too: omp 18.20 reports no paths for it (no `approvalCacheTargets`), so the add-on cannot check that it stays inside the copy. Nested calls through `xd://` devices are refused the same way. At startup the add-on checks that every file tool it shadows has such a parser; if one is missing, it refuses everything.
 
-Configuration, in the omp process's environment:
+## What still runs on this machine, and other measured limits
+Probed on omp 18.20.0 with a scripted provider (no model):
+- **User `!` commands** typed in omp's TUI run on this machine, as before. They come from the user, not the agent.
+- **Output minimizer:** it recognizes the command inside the rewritten line, and `git status`/`git diff`/`git log` output was identical to native. A large `cat` gets the same outline as native and is then cut once more by bash's output limit, with an artifact link: less output, nothing extra.
+- **Sync cost with LocalBackend** on a 1,455-file, 30 MB tree (a copy of the gitmoot repo on a local SSD): first fill 1.9 s; a pull or push with nothing changed about 0.1 s each; so about 0.2 s per tool call before any remote round trips.
+- **Subagents** (`task`) are refused until their tools can be confined too.
+
+## Configuration
+In the omp process's environment:
 
 | Variable | Meaning |
 |---|---|

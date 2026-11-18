@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { Backend, SyncFile } from "./backend.ts";
+import type { Backend, Changes, SyncFile, TreeEntry } from "./backend.ts";
 
 /** A sync could not keep the host copy and the sandbox consistent; the mirror refuses further work. */
 export class MirrorError extends Error {
@@ -12,10 +12,21 @@ export class MirrorError extends Error {
 	}
 }
 
-/** How a path looked on the host at the last sync, by the mirror's own writes or a push. */
+/** A path present on both sides at the last sync. */
 interface Known {
 	type: "file" | "dir";
-	fingerprint: string;
+	/** The host path's identity then: a file's size, times, inode and mode; a directory's device and inode. */
+	host: string;
+	/** The sandbox entry then, as `changes` reports it; "" when not yet seen there (just pushed). */
+	remote: string;
+	/**
+	 * Whether a sandbox delete may remove the host path. A file the mirror
+	 * synced always may (when unchanged here). A directory may only when the
+	 * mirror made it while pulling, or it exists in the sandbox because the
+	 * mirror pushed files into it; a directory the mirror merely found here is
+	 * never removed.
+	 */
+	owned: boolean;
 }
 
 interface Scanned {
@@ -23,11 +34,14 @@ interface Scanned {
 	fingerprint: string;
 }
 
+type Kind = "changed" | "deleted";
+
 /** Files moved per pull or push call, so one call never carries an unbounded batch. */
 const BATCH = 256;
 const O_CREATE_NEW = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
 const O_READ = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
-const TEMP_PREFIX = ".omp-sandbox-";
+/** How many conflicting paths a conflict error names. */
+const CONFLICTS_SHOWN = 5;
 
 /**
  * A host copy of the sandbox's workspace tree, for omp's own file tools to
@@ -38,10 +52,15 @@ const TEMP_PREFIX = ".omp-sandbox-";
  * special file is not created here (a symlink could lead a host tool out of
  * the copy), and `.git` is not mirrored.
  *
- * The mirror never deletes or overwrites a host path it did not write itself
- * or that changed here since it last synced: that is a conflict, and like
- * any other sync failure it breaks the mirror. A broken mirror refuses every
- * further sync, so nothing runs against a copy that no longer matches.
+ * Conflicts are never resolved: a path changed on both sides since the last
+ * sync, or a host path the mirror would have to delete or overwrite without
+ * owning it, breaks the mirror. So does any other sync failure. A broken
+ * mirror refuses every further sync, so nothing runs against a copy that no
+ * longer matches the sandbox.
+ *
+ * Syncs run one at a time (an internal queue), and the host copy is changed
+ * only by the mirror and by the tools between syncs: a scan never sees a
+ * transfer in progress.
  */
 export class Mirror {
 	readonly hostRoot: string;
@@ -81,7 +100,11 @@ export class Mirror {
 		return this.#exclusive(() => this.#pull());
 	}
 
-	/** Send host-side changes (new, modified and deleted files) to the sandbox. */
+	/**
+	 * Send host-side changes (new, modified and deleted files) to the sandbox.
+	 * What changed in the sandbox meanwhile is checked first: any overlap is a
+	 * conflict and nothing is sent.
+	 */
 	pushLocal(): Promise<void> {
 		return this.#exclusive(() => this.#push());
 	}
@@ -103,92 +126,141 @@ export class Mirror {
 
 	async #pull(): Promise<void> {
 		const changes = await this.#backend.changes(this.#token);
-		let deleted = changes.deleted;
-		if (changes.full) {
-			const listed = new Set(changes.changed.map(entry => entry.path));
-			deleted = [...this.#known.keys()].filter(rel => !listed.has(rel));
-		}
-		for (const rel of [...deleted].sort(deepestFirst)) await this.#removeHost(rel, "deleted in the sandbox");
-
-		const files: string[] = [];
-		for (const entry of changes.changed) {
-			const parts = relativeParts(entry.path);
-			if (entry.type === "dir") await this.#ensureDir(parts);
-			else if (entry.type === "file") files.push(entry.path);
-			// A symlink or special file: not mirrored. What the mirror held there goes.
-			else await this.#removeHost(entry.path, `a ${entry.type} in the sandbox now`);
-		}
-		for (let start = 0; start < files.length; start += BATCH) {
-			for (const file of await this.#backend.pull(files.slice(start, start + BATCH))) await this.#writeHost(file);
-		}
+		await this.#apply(this.#remoteDelta(changes));
 		this.#token = changes.token;
 	}
 
 	async #push(): Promise<void> {
 		const scan = await this.#scanHost();
-		const changed: string[] = [];
+		const local = new Map<string, Kind>();
 		for (const [rel, entry] of scan) {
 			if (entry.type === "symlink" || entry.type === "other") {
 				throw new MirrorError(`${rel} is a ${entry.type} in the workspace copy; only files and directories are synced`);
 			}
-			if (entry.type === "file" && this.#known.get(rel)?.fingerprint !== entry.fingerprint) changed.push(rel);
+			if (entry.type === "dir" && this.#known.get(rel)?.type === "file") {
+				throw new MirrorError(`${rel} was a synced file and is now a directory in the workspace copy; that change is not synced`);
+			}
+			if (entry.type === "file" && this.#known.get(rel)?.host !== entry.fingerprint) local.set(rel, "changed");
 		}
+		for (const rel of this.#known.keys()) if (!scan.has(rel)) local.set(rel, "deleted");
+		if (local.size === 0) return;
+
+		// What the sandbox did since the last sync, checked before anything is sent.
+		const changes = await this.#backend.changes(this.#token);
+		const remote = this.#remoteDelta(changes);
+		const conflicts = overlap(local, remote);
+		if (conflicts.length > 0) {
+			const shown = conflicts.slice(0, CONFLICTS_SHOWN).join(", ");
+			const more = conflicts.length > CONFLICTS_SHOWN ? ` and ${conflicts.length - CONFLICTS_SHOWN} more` : "";
+			throw new MirrorError(`changed both in the sandbox and in the workspace copy since the last sync: ${shown}${more}`);
+		}
+		await this.#apply(remote);
+		this.#token = changes.token;
+
+		const changed = [...local].filter(([, kind]) => kind === "changed").map(([rel]) => rel);
 		for (let start = 0; start < changed.length; start += BATCH) {
 			const batch: SyncFile[] = [];
 			const fingerprints: string[] = [];
 			for (const rel of changed.slice(start, start + BATCH)) {
 				const read = await this.#readHost(rel);
-				if (read === undefined) continue; // removed since the scan; the next push sends that
+				if (read === undefined) continue; // gone since the scan; the next push sends the delete
 				batch.push(read.file);
 				fingerprints.push(read.fingerprint);
 			}
 			await this.#backend.push(batch);
-			batch.forEach((file, index) => {
-				this.#known.set(file.path, { type: "file", fingerprint: fingerprints[index] as string });
-				// The sandbox created its parents, so a later delete here must remove them there too.
+			for (const [index, file] of batch.entries()) {
+				this.#known.set(file.path, { type: "file", host: fingerprints[index] as string, remote: "", owned: true });
+				// The sandbox created any missing parents, so a later delete here must reach them
+				// there, and a delete there may remove them here (when still empty): the directory
+				// exists on both sides because of this push. Its identity is recorded, so a
+				// replacement made later is never removed.
 				const parts = file.path.split("/");
 				for (let depth = 1; depth < parts.length; depth++) {
-					const parent = parts.slice(0, depth).join("/");
-					if (!this.#known.has(parent)) this.#known.set(parent, { type: "dir", fingerprint: "dir" });
+					const parent = parts.slice(0, depth);
+					const rel = parent.join("/");
+					if (this.#known.has(rel)) continue;
+					const info = await fs.lstat(this.#host(parent));
+					this.#known.set(rel, { type: "dir", host: dirFingerprint(info), remote: "", owned: true });
 				}
-			});
+			}
 		}
-		// Directories are removed after their contents: deepest first. An empty
-		// directory created here is not sent; the sandbox creates parents itself.
-		const removed = [...this.#known.keys()].filter(rel => !scan.has(rel)).sort(deepestFirst);
+		// Directories after their contents: deepest first.
+		const removed = [...local].filter(([, kind]) => kind === "deleted").map(([rel]) => rel).sort(deepestFirst);
 		for (let start = 0; start < removed.length; start += BATCH) {
 			const batch = removed.slice(start, start + BATCH);
 			await this.#backend.remove(batch);
 			for (const rel of batch) this.#known.delete(rel);
 		}
-		// Advance the token past what was just sent. Otherwise a file pushed now
-		// and deleted in the sandbox before the next pull is in neither the
-		// token's manifest nor the sandbox, so `changes` never reports it and the
-		// copy keeps it. The echo of the push itself is skipped by #writeHost.
-		if (changed.length > 0 || removed.length > 0) await this.#pull();
+		// Move the token past what was just sent, so a later sandbox change to
+		// one of these paths (even a delete) is reported. The echo of the push
+		// itself is recognized by #writeHost and not rewritten.
+		await this.#pull();
 	}
 
-	/** Remove a host path the mirror wrote, unless it changed here since. */
+	/**
+	 * The sandbox's changes as entries to apply: everything `changes` reported,
+	 * or for a full listing only what differs from the last sync, plus what it
+	 * no longer lists.
+	 */
+	#remoteDelta(changes: Changes): { changed: TreeEntry[]; deleted: string[] } {
+		const current = (entry: TreeEntry) => this.#known.get(entry.path)?.remote !== remoteFingerprint(entry);
+		if (!changes.full) return { changed: changes.changed.filter(current), deleted: changes.deleted };
+		const listed = new Set(changes.changed.map(entry => entry.path));
+		return { changed: changes.changed.filter(current), deleted: [...this.#known.keys()].filter(rel => !listed.has(rel)) };
+	}
+
+	async #apply(delta: { changed: TreeEntry[]; deleted: string[] }): Promise<void> {
+		for (const rel of [...delta.deleted].sort(deepestFirst)) await this.#removeHost(rel, "deleted in the sandbox");
+		const files = new Map<string, TreeEntry>();
+		// `changes` lists in byte order, so a directory comes before what is in it.
+		for (const entry of delta.changed) {
+			const parts = relativeParts(entry.path);
+			if (entry.type === "dir") {
+				await this.#ensureDir(parts);
+				const known = this.#known.get(entry.path);
+				if (known !== undefined) known.remote = remoteFingerprint(entry);
+			} else if (entry.type === "file") files.set(entry.path, entry);
+			// A symlink or special file: not mirrored. A file the mirror held there goes.
+			else await this.#removeHost(entry.path, `a ${entry.type} in the sandbox now`);
+		}
+		const paths = [...files.keys()];
+		for (let start = 0; start < paths.length; start += BATCH) {
+			for (const file of await this.#backend.pull(paths.slice(start, start + BATCH))) {
+				await this.#writeHost(file, remoteFingerprint(files.get(file.path) as TreeEntry));
+			}
+		}
+	}
+
+	/**
+	 * Remove a host path the mirror owns because the sandbox no longer has it.
+	 * A file changed here since is a conflict. A directory is removed only
+	 * when the mirror made it, it is still that directory, and it is empty;
+	 * otherwise it stays and the mirror stops tracking it.
+	 */
 	async #removeHost(rel: string, why: string): Promise<void> {
 		const parts = relativeParts(rel);
 		const known = this.#known.get(rel);
-		if (known === undefined) return; // never written here: not the mirror's to remove
+		if (known === undefined) return; // never synced: not the mirror's to remove
 		const target = await this.#lstatInside(parts);
 		if (target === undefined) {
 			this.#known.delete(rel);
 			return;
 		}
-		if (known.type === "dir" && target.isDirectory()) {
+		if (known.type === "dir") {
+			if (!known.owned || !target.isDirectory() || dirFingerprint(target) !== known.host) {
+				this.#known.delete(rel);
+				return;
+			}
 			try {
 				await fs.rmdir(this.#host(parts));
 				this.#known.delete(rel);
 			} catch (error) {
-				// Files created here that are not synced yet: kept, and so is the directory.
+				// Files made here and not synced yet: the directory stays, and so does its record.
 				if (!isCode(error, "ENOTEMPTY") && !isCode(error, "EEXIST")) throw error;
 			}
 			return;
 		}
-		if (known.type === "file" && target.isFile() && fileFingerprint(target) === known.fingerprint) {
+		if (target.isFile() && fileFingerprint(target) === known.host) {
 			await fs.unlink(this.#host(parts));
 			this.#known.delete(rel);
 			return;
@@ -200,9 +272,13 @@ export class Mirror {
 		for (let depth = 1; depth <= parts.length; depth++) {
 			const prefix = parts.slice(0, depth);
 			const rel = prefix.join("/");
-			const info = await lstatOrUndefined(this.#host(prefix));
+			let info = await lstatOrUndefined(this.#host(prefix));
 			if (info?.isDirectory()) {
-				if (!this.#known.has(rel)) this.#known.set(rel, { type: "dir", fingerprint: "dir" });
+				const known = this.#known.get(rel);
+				// One the mirror did not make (or a replacement of one it did) is tracked, never owned.
+				if (known === undefined || known.type !== "dir" || known.host !== dirFingerprint(info)) {
+					this.#known.set(rel, { type: "dir", host: dirFingerprint(info), remote: known?.remote ?? "", owned: false });
+				}
 				continue;
 			}
 			if (info !== undefined) {
@@ -213,12 +289,13 @@ export class Mirror {
 				}
 			}
 			await fs.mkdir(this.#host(prefix));
-			this.#known.set(rel, { type: "dir", fingerprint: "dir" });
+			info = await fs.lstat(this.#host(prefix));
+			this.#known.set(rel, { type: "dir", host: dirFingerprint(info), remote: "", owned: true });
 		}
 	}
 
 	/** Write a pulled file, unless the host copy holds changes of its own there. */
-	async #writeHost(file: SyncFile): Promise<void> {
+	async #writeHost(file: SyncFile, remote: string): Promise<void> {
 		const parts = relativeParts(file.path);
 		await this.#ensureDir(parts.slice(0, -1));
 		const target = this.#host(parts);
@@ -227,17 +304,18 @@ export class Mirror {
 		if (info === undefined) {
 			if (known !== undefined) throw new MirrorError(`${file.path} changed in the sandbox, but was deleted in the workspace copy`);
 		} else if (info.isDirectory() && known?.type === "dir") {
-			// A directory the mirror made, now a file in the sandbox; its contents were deleted first.
+			// A directory, now a file in the sandbox; its contents were deleted first.
 			await this.#removeHost(file.path, "replaced by a file in the sandbox");
 			if ((await lstatOrUndefined(target)) !== undefined) {
-				throw new MirrorError(`${file.path} is a file in the sandbox but a non-empty directory in the workspace copy`);
+				throw new MirrorError(`${file.path} is a file in the sandbox but a directory in the workspace copy`);
 			}
-		} else if (!info.isFile() || known === undefined || fileFingerprint(info) !== known.fingerprint) {
+		} else if (!info.isFile() || known === undefined || fileFingerprint(info) !== known.host) {
 			throw new MirrorError(`${file.path} changed in the sandbox and in the workspace copy`);
 		} else if ((info.mode & 0o7777) === file.mode && Buffer.from(await fs.readFile(target)).equals(file.data)) {
-			return; // unchanged, e.g. the echo of a push: no rewrite, so its mtime stays
+			known.remote = remote; // unchanged, e.g. the echo of a push: not rewritten, so its times stay
+			return;
 		}
-		const temp = this.#host([...parts.slice(0, -1), `${TEMP_PREFIX}pull-${randomUUID()}`]);
+		const temp = this.#host([...parts.slice(0, -1), `.omp-sandbox-pull-${randomUUID()}`]);
 		const handle = await fs.open(temp, O_CREATE_NEW, 0o600);
 		try {
 			try {
@@ -251,7 +329,7 @@ export class Mirror {
 			await fs.unlink(temp).catch(() => undefined);
 			throw error;
 		}
-		this.#known.set(file.path, { type: "file", fingerprint: fileFingerprint(await fs.lstat(target)) });
+		this.#known.set(file.path, { type: "file", host: fileFingerprint(await fs.lstat(target)), remote, owned: true });
 	}
 
 	/** A host file's contents and the fingerprint of exactly what was read. */
@@ -279,12 +357,11 @@ export class Mirror {
 		const walk = async (dir: string, rel: string): Promise<void> => {
 			for (const name of await fs.readdir(dir)) {
 				if (rel === "" && name === ".git") continue;
-				if (name.startsWith(TEMP_PREFIX)) continue;
 				const childRel = rel === "" ? name : `${rel}/${name}`;
 				const info = await lstatOrUndefined(path.join(dir, name));
 				if (info === undefined) continue;
 				if (info.isDirectory()) {
-					found.set(childRel, { type: "dir", fingerprint: "dir" });
+					found.set(childRel, { type: "dir", fingerprint: dirFingerprint(info) });
 					await walk(path.join(dir, name), childRel);
 				} else if (info.isFile()) found.set(childRel, { type: "file", fingerprint: fileFingerprint(info) });
 				else found.set(childRel, { type: info.isSymbolicLink() ? "symlink" : "other", fingerprint: "" });
@@ -309,6 +386,37 @@ export class Mirror {
 	}
 }
 
+/**
+ * Paths changed on both sides: the same path, or one inside the other (a file
+ * edited here in a directory the sandbox deleted, and the reverse). A path
+ * deleted on both sides is no conflict.
+ */
+function overlap(local: ReadonlyMap<string, Kind>, remote: { changed: TreeEntry[]; deleted: string[] }): string[] {
+	const remoteKinds = new Map<string, Kind>();
+	for (const entry of remote.changed) remoteKinds.set(entry.path, "changed");
+	for (const rel of remote.deleted) remoteKinds.set(rel, "deleted");
+	const clash = (a: Kind, b: Kind) => !(a === "deleted" && b === "deleted");
+	const found = new Set<string>();
+	for (const [rel, kind] of remoteKinds) {
+		for (const candidate of [rel, ...ancestors(rel)]) {
+			const mine = local.get(candidate);
+			if (mine !== undefined && clash(mine, kind)) found.add(candidate === rel ? rel : `${candidate} (and ${rel})`);
+		}
+	}
+	for (const [rel, kind] of local) {
+		for (const parent of ancestors(rel)) {
+			const theirs = remoteKinds.get(parent);
+			if (theirs !== undefined && clash(kind, theirs)) found.add(`${rel} (and ${parent})`);
+		}
+	}
+	return [...found].sort();
+}
+
+function ancestors(rel: string): string[] {
+	const parts = rel.split("/");
+	return parts.slice(1).map((_, index) => parts.slice(0, index + 1).join("/"));
+}
+
 /** A workspace-relative path's components; refuses anything that could leave the copy. */
 function relativeParts(rel: string): string[] {
 	const parts = rel.split("/");
@@ -321,6 +429,15 @@ function relativeParts(rel: string): string[] {
 
 function fileFingerprint(info: Stats): string {
 	return `${info.size}:${info.mtimeMs}:${info.ctimeMs}:${info.ino}:${info.mode & 0o7777}`;
+}
+
+function dirFingerprint(info: Stats): string {
+	return `dir:${info.dev}:${info.ino}`;
+}
+
+/** A directory's size and mtime move with its contents, so only its type and mode identify its state. */
+function remoteFingerprint(entry: TreeEntry): string {
+	return entry.type === "dir" ? `dir:${entry.mode}` : `${entry.type}:${entry.size}:${entry.mtimeMs}:${entry.mode}`;
 }
 
 async function lstatOrUndefined(file: string): Promise<Stats | undefined> {

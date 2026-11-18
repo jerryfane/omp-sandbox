@@ -146,6 +146,90 @@ describe("Mirror", () => {
 		expect(await fs.readFile(path.join(host, "c.txt"), "utf8")).toBe("host");
 	});
 
+	test("a push checks the sandbox first: a file changed on both sides is not overwritten there", async () => {
+		await put(sandbox, "c.txt", "base");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await tick();
+		// A background job changes the file in the sandbox after the pull; a tool edits the copy.
+		await put(sandbox, "c.txt", "sandbox");
+		await put(host, "c.txt", "host");
+		await expect(mirror.pushLocal()).rejects.toThrow(/changed both in the sandbox and in the workspace copy.*c\.txt/);
+		expect(await fs.readFile(path.join(sandbox, "c.txt"), "utf8")).toBe("sandbox");
+		expect(await fs.readFile(path.join(host, "c.txt"), "utf8")).toBe("host");
+		expect(mirror.broken).toBeDefined();
+	});
+
+	test("a push conflicts with a sandbox change to a directory around a file changed here", async () => {
+		await put(sandbox, "d/f.txt", "base");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await tick();
+		await fs.rm(path.join(sandbox, "d"), { recursive: true });
+		await put(host, "d/f.txt", "host");
+		await expect(mirror.pushLocal()).rejects.toThrow(/d\/f\.txt/);
+		expect(await tree(sandbox)).toEqual([]);
+	});
+
+	test("a push sends a file while the sandbox changed a different one, and brings that one in", async () => {
+		await put(sandbox, "mine.txt", "1");
+		await put(sandbox, "theirs.txt", "1");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await tick();
+		await put(sandbox, "theirs.txt", "2");
+		await put(host, "mine.txt", "2");
+		await mirror.pushLocal();
+		expect(await tree(sandbox)).toEqual(["mine.txt=2", "theirs.txt=2"]);
+		expect(await tree(host)).toEqual(["mine.txt=2", "theirs.txt=2"]);
+	});
+
+	test("workspace files whose names look like the mirror's temp files are synced like any other", async () => {
+		await put(sandbox, ".omp-sandbox-notes.txt", "keep me");
+		await put(sandbox, "d/.omp-sandbox-pull-x", "and me");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual([".omp-sandbox-notes.txt=keep me", "d/", "d/.omp-sandbox-pull-x=and me"]);
+		await mirror.pushLocal();
+		expect(await tree(sandbox)).toEqual([".omp-sandbox-notes.txt=keep me", "d/", "d/.omp-sandbox-pull-x=and me"]);
+	});
+
+	test("a sandbox delete never removes a host directory the mirror found rather than made", async () => {
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		// Made here by a tool and, before any push, also made in the sandbox.
+		await fs.mkdir(path.join(host, "found"));
+		await put(sandbox, "found/remote.txt", "r");
+		await mirror.pullRemote();
+		await fs.rm(path.join(sandbox, "found"), { recursive: true });
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual(["found/"]);
+	});
+
+	test("a sandbox delete never removes a host directory replaced since the last sync", async () => {
+		await put(sandbox, "d/a.txt", "a");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		// The mirror's d is replaced by another directory of the same name. The new
+		// one is made while the old still exists, so it cannot reuse its inode.
+		await fs.rename(path.join(host, "d"), path.join(host, "old-d"));
+		await fs.mkdir(path.join(host, "d"));
+		await fs.rm(path.join(host, "old-d"), { recursive: true });
+		await fs.rm(path.join(sandbox, "d"), { recursive: true });
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual(["d/"]);
+	});
+
+	test("a directory made here only to hold a pushed file is removed here when the sandbox deletes it", async () => {
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await put(host, "made/f.txt", "f");
+		await mirror.pushLocal();
+		await fs.rm(path.join(sandbox, "made"), { recursive: true });
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual([]);
+	});
+
 	test("a sandbox delete of a file edited in the copy is a conflict, and the edit survives", async () => {
 		await put(sandbox, "e.txt", "base");
 		const mirror = await Mirror.create(backend, host);
