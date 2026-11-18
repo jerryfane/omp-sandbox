@@ -1,0 +1,23 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    name: typecheck / test
+    # Private-repo Actions minutes are unavailable (owner: no new spend), so CI
+    # runs on the hetzner2 runner (fleetup #105). Before this repo goes public,
+    # switch back to ubuntu-latest and have fleetup remove the runner: pull
+    # requests from forks must never run on hetzner2.
+    runs-on: [self-hosted, linux, x64, h2-ci]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+      - run: bunx tsc --noEmit
+      - run: bun test

@@ -1,0 +1,15 @@
+{
+	"name": "omp-sandbox",
+	"version": "0.0.0",
+	"private": true,
+	"description": "omp add-on: run an agent's tools (bash, read, edit, write, grep, glob) in a remote sandbox while the agent stays on your machine",
+	"type": "module",
+	"scripts": {
+		"test": "bun test",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@types/bun": "1.3.14",
+		"typescript": "5.9.3"
+	}
+}
