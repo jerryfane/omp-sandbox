@@ -81,6 +81,12 @@ await probe?.close();
 if (fullSupported) modes.push({ containment: "full" as const });
 else console.warn("omp-sandbox: no pid namespace here (unshare failed); 'full' containment tests are skipped");
 
+// Root can always create a pid namespace, so there "full" being unavailable is
+// a LocalBackend bug, not a host limit, and must fail instead of skipping.
+test.if(process.getuid?.() === 0)("root gets full containment", () => {
+	expect(fullSupported).toBe(true);
+});
+
 describe.each(modes)("exec, containment $containment", ({ containment }) => {
 	let local: LocalBackend;
 	beforeEach(async () => {
@@ -188,12 +194,61 @@ describe.each(modes)("exec, containment $containment", ({ containment }) => {
 		expect(await survivorsOf(escaped)).toEqual([]);
 	});
 
+	test("a command ended by a signal reports that signal, with nothing added to stderr", async () => {
+		const result = await local.exec("kill -TERM $$", { cwd: local.root });
+		expect(result.exitCode).toBeNull();
+		expect(result.signal).toBe("SIGTERM");
+		expect(result.stderr).toBe("");
+		expect(result.timedOut || result.aborted).toBe(false);
+	});
+
+	test("an exit status above 128 is an exit code, not a signal", async () => {
+		const result = await local.exec("exit 143", { cwd: local.root });
+		expect(result.exitCode).toBe(143);
+		expect(result.signal).toBeNull();
+	});
+
+	test("the command cannot reach the backend's status channel", async () => {
+		// fd 3 carries the namespace init's report in full mode; the command's
+		// copy is closed, so it cannot fake a signal death.
+		const result = await local.exec("echo 15 >&3", { cwd: local.root });
+		expect(result.exitCode).toBe(1);
+		expect(result.signal).toBeNull();
+	});
+
 	test("refuses a cwd outside the root or through a symlink", async () => {
 		await rejectsWith(local.exec("true", { cwd: hostDir }), "OUTSIDE_ROOT");
 		await fs.symlink(hostDir, path.join(sandboxDir, "to-host"));
 		await rejectsWith(local.exec("true", { cwd: path.join(local.root, "to-host") }), "SYMLINK");
 	});
 });
+
+/**
+ * Runs test/fixtures/list-recursive.ts on `root` as an unprivileged user, where
+ * directory permissions apply. As root it runs as nobody (uid 65534) from a
+ * copy that user can read; otherwise as the current user.
+ */
+async function listRecursiveUnprivileged(root: string): Promise<unknown> {
+	const fixture = path.join(import.meta.dir, "fixtures/list-recursive.ts");
+	let argv = [process.execPath, fixture, root];
+	let env: Record<string, string> = { PATH: "/usr/bin:/bin", HOME: scratch };
+	if (process.getuid?.() === 0) {
+		const code = path.join(scratch, "code");
+		await fs.mkdir(path.join(code, "src"), { recursive: true });
+		await fs.mkdir(path.join(code, "test/fixtures"), { recursive: true });
+		for (const file of ["src/backend.ts", "src/local-backend.ts", "test/fixtures/list-recursive.ts"]) {
+			await fs.copyFile(path.join(import.meta.dir, "..", file), path.join(code, file));
+		}
+		await fs.chmod(scratch, 0o755);
+		expect(Bun.spawnSync(["chown", "-R", "65534:65534", code, root]).exitCode).toBe(0);
+		argv = ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--", process.execPath, path.join(code, "test/fixtures/list-recursive.ts"), root];
+		env = { PATH: "/usr/bin:/bin", HOME: code, TMPDIR: code };
+	}
+	const child = Bun.spawn(argv, { env, stdout: "pipe", stderr: "pipe" });
+	const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+	if (code !== 0) throw new Error(`fixture exited ${code}: ${err}`);
+	return JSON.parse(out);
+}
 
 describe("files", () => {
 	test("write then read round-trips bytes and creates parent directories", async () => {
@@ -202,6 +257,17 @@ describe("files", () => {
 		await backend.writeFile(file, bytes, { mode: 0o755 });
 		expect(await backend.readFile(file)).toEqual(bytes);
 		expect((await fs.stat(path.join(sandboxDir, "a/b/c.bin"))).mode & 0o777).toBe(0o755);
+	});
+
+	test("a recursive list fails on a subdirectory it cannot open instead of dropping it", async () => {
+		await fs.mkdir(path.join(sandboxDir, "private/leaf"), { recursive: true });
+		await fs.writeFile(path.join(sandboxDir, "visible"), "");
+		await fs.chmod(path.join(sandboxDir, "private"), 0o000);
+		try {
+			expect(await listRecursiveUnprivileged(sandboxDir)).toEqual({ error: "EACCES" });
+		} finally {
+			await fs.chmod(path.join(sandboxDir, "private"), 0o755);
+		}
 	});
 
 	test("a rewrite without mode keeps the existing mode", async () => {

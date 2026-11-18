@@ -2,7 +2,9 @@ import { spawn, spawnSync } from "node:child_process";
 import { constants, readdirSync, readFileSync, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
+import { constants as osConstants } from "node:os";
 import * as path from "node:path";
+import { Readable } from "node:stream";
 import {
 	type Backend,
 	BackendError,
@@ -35,11 +37,52 @@ const O_READ = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const O_WRITE = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 /**
- * The pid-namespace "init": runs the command as its child (so the command is
- * not PID 1 and keeps normal signal behaviour) and exits with its status. When
- * it exits, the kernel kills everything left in the namespace.
+ * The pid-namespace "init" (PID 1), a small Python program. It runs the
+ * command as its child, so the command is not PID 1 and keeps normal signal
+ * behaviour, reaps orphans, and exits with the command's status. When it
+ * exits, the kernel kills everything left in the namespace.
+ *
+ * A shell init cannot tell "killed by SIGTERM" from "exit 143", so when the
+ * command dies of a signal the init writes the signal number to fd 3, a pipe
+ * only it holds (the command's copy is closed before exec). It prints
+ * nothing of its own, except when bash cannot be started at all.
  */
-const NAMESPACE_INIT = 'bash -c "$1" omp-sandbox; status=$?; exit "$status"';
+const NAMESPACE_INIT = `import os, sys
+def report(text):
+    try:
+        os.write(3, text)
+    except OSError:
+        pass
+pid = os.fork()
+if pid == 0:
+    try:
+        os.close(3)
+    except OSError:
+        pass
+    try:
+        os.execvp("bash", ["bash", "-c", sys.argv[1]])
+    except OSError as error:
+        os.write(2, ("omp-sandbox: cannot start bash: %s\\n" % error).encode())
+        os._exit(127)
+while True:
+    try:
+        done, status = os.waitpid(-1, 0)
+    except ChildProcessError:
+        os._exit(127)
+    if done == pid:
+        break
+if os.WIFSIGNALED(status):
+    report(b"%d" % os.WTERMSIG(status))
+    os._exit(128 + os.WTERMSIG(status))
+os._exit(os.WEXITSTATUS(status))
+`;
+
+/** `python3 -I -S -c NAMESPACE_INIT <command>`: isolated mode, no site import. */
+const INIT_ARGS = ["python3", "-I", "-S", "-c", NAMESPACE_INIT];
+
+const SIGNAL_NAMES: ReadonlyMap<number, NodeJS.Signals> = new Map(
+	Object.entries(osConstants.signals).map(([name, number]) => [number, name as NodeJS.Signals]),
+);
 
 /** A sandbox path below `dir`, resolved through an open directory descriptor. */
 function at(dirFd: number, name: string): string {
@@ -117,16 +160,30 @@ export class LocalBackend implements Backend {
 			return result;
 		}
 
-		const [file, args] =
-			this.containment === "full"
-				? (["unshare", [...namespaceFlags(), "--", "bash", "-c", NAMESPACE_INIT, "omp-sandbox-init", command]] as const)
-				: (["bash", ["-c", command]] as const);
-		const child = spawn(file, args, {
-			cwd,
-			env: { ...BASE_ENV, HOME: this.root, ...options.env },
-			detached: true, // own process group
-			stdio: ["ignore", "pipe", "pipe"],
-		});
+		const full = this.containment === "full";
+		const child = full
+			? spawn("unshare", [...namespaceFlags(), "--", ...INIT_ARGS, command], {
+					cwd,
+					env: { ...BASE_ENV, HOME: this.root, ...options.env },
+					detached: true, // own process group
+					stdio: ["ignore", "pipe", "pipe", "pipe"], // fd 3: the init's status channel
+				})
+			: spawn("bash", ["-c", command], {
+					cwd,
+					env: { ...BASE_ENV, HOME: this.root, ...options.env },
+					detached: true,
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+		const { stdout, stderr } = child;
+		if (stdout === null || stderr === null) throw new Error("spawned with piped stdout and stderr");
+		let initStatus = "";
+		const statusPipe = child.stdio[3];
+		if (statusPipe instanceof Readable) {
+			statusPipe.setEncoding("utf8");
+			statusPipe.on("data", (text: string) => {
+				initStatus += text;
+			});
+		}
 		const kill = () => {
 			if (child.pid !== undefined) killTree(child.pid);
 		};
@@ -151,8 +208,8 @@ export class LocalBackend implements Backend {
 				options.onOutput?.(text, stream);
 			};
 		};
-		child.stdout.on("data", capture("stdout"));
-		child.stderr.on("data", capture("stderr"));
+		stdout.on("data", capture("stdout"));
+		stderr.on("data", capture("stderr"));
 
 		const timer =
 			options.timeoutMs === undefined
@@ -174,8 +231,8 @@ export class LocalBackend implements Backend {
 			result.exitCode = code;
 			result.signal = signal;
 			drain = setTimeout(() => {
-				child.stdout.destroy();
-				child.stderr.destroy();
+				stdout.destroy();
+				stderr.destroy();
 				done.resolve();
 			}, EXIT_DRAIN_MS);
 		});
@@ -188,6 +245,13 @@ export class LocalBackend implements Backend {
 		} finally {
 			clearTimeout(timer);
 			options.signal?.removeEventListener("abort", onAbort);
+			if (statusPipe instanceof Readable) statusPipe.destroy();
+		}
+		// The init survived and reported that the command itself died of a signal.
+		const reported = SIGNAL_NAMES.get(Number.parseInt(initStatus, 10));
+		if (full && result.signal === null && reported !== undefined) {
+			result.exitCode = null;
+			result.signal = reported;
 		}
 		return result;
 	}
@@ -277,9 +341,13 @@ export class LocalBackend implements Backend {
 				}
 				entries.push(info);
 				if (!options.recursive || info.type !== "dir") continue;
-				// Re-opened with O_NOFOLLOW: if it became a symlink since lstat,
-				// it is not entered.
-				const child = await fs.open(at(dirFd, name), O_DIR).catch(() => undefined);
+				// Re-opened with O_NOFOLLOW. Removed, or replaced by a symlink or a
+				// file since lstat: not entered. Anything else (permissions,
+				// resource limits) is an error, never a silently shorter listing.
+				const child = await fs.open(at(dirFd, name), O_DIR).catch((error: unknown) => {
+					if (isCode(error, "ENOENT") || isCode(error, "ENOTDIR") || isCode(error, "ELOOP")) return undefined;
+					throw mapFsError(error, sandboxPath);
+				});
 				if (child === undefined) continue;
 				try {
 					await walk(child.fd, sandboxPath);
@@ -368,9 +436,10 @@ function requireRegular(info: Stats, file: string): void {
 
 let pidNamespaceSupport: boolean | undefined;
 
-/** Whether `unshare` can create a pid namespace here (probed once per process). */
+/** Whether `unshare` can run the namespace init here (probed once per process). */
 function canCreatePidNamespace(): boolean {
-	pidNamespaceSupport ??= spawnSync("unshare", [...namespaceFlags(), "--", "true"], { stdio: "ignore" }).status === 0;
+	pidNamespaceSupport ??=
+		spawnSync("unshare", [...namespaceFlags(), "--", ...INIT_ARGS, "true"], { stdio: "ignore" }).status === 0;
 	return pidNamespaceSupport;
 }
 
@@ -464,6 +533,8 @@ const FS_CODES: Readonly<Record<string, BackendErrorCode>> = {
 	ENOTDIR: "ENOTDIR",
 	ELOOP: "SYMLINK",
 	ENXIO: "NOT_REGULAR", // a FIFO opened for writing with no reader
+	EACCES: "EACCES",
+	EPERM: "EACCES",
 };
 
 function mapFsError(error: unknown, file: string): unknown {

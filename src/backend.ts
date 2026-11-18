@@ -39,9 +39,12 @@ export interface ExecOptions {
 }
 
 export interface ExecResult {
-	/** Process exit code, or null when it was killed by a signal. */
+	/** The command's exit code, or null when it was ended by a signal. */
 	exitCode: number | null;
-	/** Signal that ended the process, if any. */
+	/**
+	 * The signal that ended the command, if any: one it raised or received
+	 * itself, or the backend's SIGKILL on timeout or abort.
+	 */
 	signal: string | null;
 	stdout: string;
 	stderr: string;
@@ -91,9 +94,8 @@ export interface Backend {
 	 */
 	readonly containment: "full" | "process-tree";
 	/**
-	 * Run a shell command (`bash -c <command>`) in the sandbox. The command's
-	 * own exit code is reported; `signal` is set only when the backend killed
-	 * it (timeout or abort).
+	 * Run a shell command (`bash -c <command>`) in the sandbox. stdout and
+	 * stderr carry only the command's own output; the backend adds nothing.
 	 */
 	exec(command: string, options: ExecOptions): Promise<ExecResult>;
 	/** Read a whole regular file. Rejects with BackendError("ENOENT") when missing. */
@@ -129,7 +131,9 @@ export type BackendErrorCode =
 	/** The path goes through a symlink this backend will not follow. */
 	| "SYMLINK"
 	/** The path names a FIFO, socket or device, not a regular file. */
-	| "NOT_REGULAR";
+	| "NOT_REGULAR"
+	/** The sandbox refused access (permissions). */
+	| "EACCES";
 
 export class BackendError extends Error {
 	readonly code: BackendErrorCode;
