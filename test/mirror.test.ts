@@ -1,0 +1,205 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { Backend, Changes } from "../src/backend.ts";
+import { LocalBackend } from "../src/local-backend.ts";
+import { Mirror, MirrorError } from "../src/mirror.ts";
+
+let scratch: string;
+let sandbox: string;
+let host: string;
+let backend: LocalBackend;
+
+beforeEach(async () => {
+	scratch = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sandbox-mirror-"));
+	sandbox = path.join(scratch, "sandbox");
+	host = path.join(scratch, "host");
+	await fs.mkdir(sandbox);
+	await fs.mkdir(host);
+	backend = await LocalBackend.create(sandbox, { containment: "process-tree" });
+});
+
+afterEach(async () => {
+	await backend.close();
+	await fs.rm(scratch, { recursive: true, force: true });
+});
+
+async function put(root: string, rel: string, content: string, mode?: number): Promise<void> {
+	await fs.mkdir(path.dirname(path.join(root, rel)), { recursive: true });
+	await fs.writeFile(path.join(root, rel), content);
+	if (mode !== undefined) await fs.chmod(path.join(root, rel), mode);
+}
+
+async function tree(root: string): Promise<string[]> {
+	const out: string[] = [];
+	const walk = async (dir: string, rel: string): Promise<void> => {
+		for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+			const childRel = rel === "" ? entry.name : `${rel}/${entry.name}`;
+			if (entry.isDirectory()) {
+				out.push(`${childRel}/`);
+				await walk(path.join(dir, entry.name), childRel);
+			} else if (entry.isSymbolicLink()) out.push(`${childRel}@`);
+			else out.push(`${childRel}=${await fs.readFile(path.join(dir, entry.name), "utf8")}`);
+		}
+	};
+	await walk(root, "");
+	return out.sort();
+}
+
+/** mtimes are compared at a resolution the filesystem may round; a later write must look different. */
+async function tick(): Promise<void> {
+	await new Promise(resolve => setTimeout(resolve, 20));
+}
+
+describe("Mirror", () => {
+	test("the first pull copies files, directories and modes; never symlinks, special files or .git", async () => {
+		await put(sandbox, "a.txt", "A");
+		await put(sandbox, "bin/run.sh", "#!/bin/sh\n", 0o755);
+		await put(sandbox, ".git/HEAD", "ref");
+		await fs.mkdir(path.join(sandbox, "empty"));
+		await fs.symlink("/etc/passwd", path.join(sandbox, "link"));
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual(["a.txt=A", "bin/", "bin/run.sh=#!/bin/sh\n", "empty/"]);
+		expect((await fs.stat(path.join(host, "bin/run.sh"))).mode & 0o777).toBe(0o755);
+	});
+
+	test("refuses to start on a host directory that is not empty", async () => {
+		await put(host, "stray.txt", "x");
+		await expect(Mirror.create(backend, host)).rejects.toThrow(MirrorError);
+	});
+
+	test("local creates, edits, mode changes and deletes reach the sandbox; emptied directories go too", async () => {
+		await put(sandbox, "keep.txt", "k");
+		await put(sandbox, "old/gone.txt", "g");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+
+		await tick();
+		await put(host, "keep.txt", "k2");
+		await fs.chmod(path.join(host, "keep.txt"), 0o700);
+		await put(host, "new/deep/n.txt", "n");
+		await fs.rm(path.join(host, "old"), { recursive: true });
+		await mirror.pushLocal();
+		expect(await tree(sandbox)).toEqual(["keep.txt=k2", "new/", "new/deep/", "new/deep/n.txt=n"]);
+		expect((await fs.stat(path.join(sandbox, "keep.txt"))).mode & 0o777).toBe(0o700);
+
+		// The pushed state comes back as a no-op, and a later delete of a directory created by a push is sent.
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual(["keep.txt=k2", "new/", "new/deep/", "new/deep/n.txt=n"]);
+		await fs.rm(path.join(host, "new"), { recursive: true });
+		await mirror.pushLocal();
+		expect(await tree(sandbox)).toEqual(["keep.txt=k2"]);
+	});
+
+	test("sandbox edits, deletes and type changes reach the host copy", async () => {
+		await put(sandbox, "f.txt", "1");
+		await put(sandbox, "d/inner.txt", "i");
+		await put(sandbox, "becomes-dir", "file");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+
+		await tick();
+		await put(sandbox, "f.txt", "2");
+		await fs.rm(path.join(sandbox, "d"), { recursive: true });
+		await put(sandbox, "d", "now a file");
+		await fs.rm(path.join(sandbox, "becomes-dir"));
+		await put(sandbox, "becomes-dir/x.txt", "x");
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual(["becomes-dir/", "becomes-dir/x.txt=x", "d=now a file", "f.txt=2"]);
+	});
+
+	test("a file pushed and then deleted in the sandbox disappears from the copy", async () => {
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await put(host, "brief.txt", "pushed");
+		await mirror.pushLocal();
+		expect(await tree(sandbox)).toEqual(["brief.txt=pushed"]);
+		await fs.rm(path.join(sandbox, "brief.txt"));
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual([]);
+	});
+
+	test("a file that became a symlink in the sandbox is removed from the copy, not followed", async () => {
+		await put(sandbox, "s.txt", "s");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await fs.rm(path.join(sandbox, "s.txt"));
+		await fs.symlink("/etc/passwd", path.join(sandbox, "s.txt"));
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual([]);
+	});
+
+	test("a file changed on both sides is a conflict: the mirror stops and refuses every later sync", async () => {
+		await put(sandbox, "c.txt", "base");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await tick();
+		await put(sandbox, "c.txt", "sandbox");
+		await put(host, "c.txt", "host");
+		await expect(mirror.pullRemote()).rejects.toThrow(/changed in the sandbox and in the workspace copy/);
+		expect(mirror.broken).toBeDefined();
+		await expect(mirror.pushLocal()).rejects.toThrow(MirrorError);
+		// Neither side was overwritten.
+		expect(await fs.readFile(path.join(sandbox, "c.txt"), "utf8")).toBe("sandbox");
+		expect(await fs.readFile(path.join(host, "c.txt"), "utf8")).toBe("host");
+	});
+
+	test("a sandbox delete of a file edited in the copy is a conflict, and the edit survives", async () => {
+		await put(sandbox, "e.txt", "base");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await tick();
+		await put(host, "e.txt", "edited");
+		await fs.rm(path.join(sandbox, "e.txt"));
+		await expect(mirror.pullRemote()).rejects.toThrow(MirrorError);
+		expect(await fs.readFile(path.join(host, "e.txt"), "utf8")).toBe("edited");
+	});
+
+	test("a sandbox delete never removes a host file the mirror did not write", async () => {
+		await put(sandbox, "dir/a.txt", "a");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await put(host, "dir/unsynced.txt", "mine");
+		await fs.rm(path.join(sandbox, "dir"), { recursive: true });
+		await mirror.pullRemote();
+		// dir stays because it holds a file not synced yet; that file is untouched.
+		expect(await tree(host)).toEqual(["dir/", "dir/unsynced.txt=mine"]);
+	});
+
+	test("a symlink created in the copy is refused, not pushed", async () => {
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await fs.symlink("/etc/passwd", path.join(host, "l"));
+		await expect(mirror.pushLocal()).rejects.toThrow(/symlink/);
+		expect(await tree(sandbox)).toEqual([]);
+	});
+
+	test("an unknown token means a full listing: deletes are found by comparing with what the copy holds", async () => {
+		await put(sandbox, "x.txt", "x");
+		await put(sandbox, "y.txt", "y");
+		// A backend that forgets every token, like one that restarted.
+		const forgetful: Backend = {
+			name: backend.name,
+			root: backend.root,
+			containment: backend.containment,
+			exec: (command, options) => backend.exec(command, options),
+			shellCommand: (command, options) => backend.shellCommand(command, options),
+			readFile: file => backend.readFile(file),
+			writeFile: (file, data, options) => backend.writeFile(file, data, options),
+			stat: file => backend.stat(file),
+			list: (dir, options) => backend.list(dir, options),
+			changes: (): Promise<Changes> => backend.changes(undefined),
+			pull: paths => backend.pull(paths),
+			push: files => backend.push(files),
+			remove: paths => backend.remove(paths),
+			close: () => backend.close(),
+		};
+		const mirror = await Mirror.create(forgetful, host);
+		await mirror.pullRemote();
+		await fs.rm(path.join(sandbox, "x.txt"));
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual(["y.txt=y"]);
+	});
+});

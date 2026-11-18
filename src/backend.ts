@@ -86,6 +86,43 @@ export interface ListResult {
 	truncated: boolean;
 }
 
+/**
+ * One entry of the workspace tree, as `changes` reports it. `path` is
+ * relative to the root and `/`-separated; it never contains `.` or `..`
+ * components.
+ */
+export interface TreeEntry {
+	path: string;
+	type: FileType;
+	size: number;
+	mtimeMs: number;
+	/** Permission bits (`mode & 0o7777`). */
+	mode: number;
+}
+
+export interface Changes {
+	/** Pass to the next `changes` call. */
+	token: string;
+	/**
+	 * True when `since` was absent or unknown to the backend: `changed` then
+	 * lists the whole tree and `deleted` is empty, so the caller must treat
+	 * anything it knows that is not listed as deleted.
+	 */
+	full: boolean;
+	/** Entries created or modified since the token (or every entry when `full`). */
+	changed: TreeEntry[];
+	/** Paths that existed at the token and exist no more. */
+	deleted: string[];
+}
+
+/** A regular file moved by `pull` or `push`; `path` as in TreeEntry. */
+export interface SyncFile {
+	path: string;
+	/** Permission bits (`mode & 0o7777`). */
+	mode: number;
+	data: Uint8Array;
+}
+
 export interface Backend {
 	/** Short name for logs and errors, e.g. "local" or "gitmoot". */
 	readonly name: string;
@@ -142,6 +179,31 @@ export interface Backend {
 	 * entered.
 	 */
 	list(path: string, options?: ListOptions): Promise<ListResult>;
+	/**
+	 * What changed in the workspace tree since `since` (a token from an
+	 * earlier call), or the whole tree when `since` is absent or unknown.
+	 * Symlinks are reported as entries, never followed. The `.git` directory
+	 * is not part of the tree.
+	 */
+	changes(since?: string): Promise<Changes>;
+	/**
+	 * The contents of the regular files at `paths`. A path that is missing or
+	 * not a regular file by the time it is read is left out; the next
+	 * `changes` reports what it became.
+	 */
+	pull(paths: readonly string[]): Promise<SyncFile[]>;
+	/**
+	 * Write each file atomically (a reader sees the old or the new contents,
+	 * never a mix), with its mode, creating parent directories as needed.
+	 * Refuses (BackendError "SYMLINK") to replace a symlink and ("EISDIR") a
+	 * directory.
+	 */
+	push(files: readonly SyncFile[]): Promise<void>;
+	/**
+	 * Remove each path: a file or symlink is unlinked, a directory removed
+	 * only when empty. A path that no longer exists is not an error.
+	 */
+	remove(paths: readonly string[]): Promise<void>;
 	/** Release the sandbox connection. The sandbox itself is not destroyed. */
 	close(): Promise<void>;
 }

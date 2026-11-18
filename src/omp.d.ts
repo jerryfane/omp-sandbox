@@ -52,6 +52,15 @@ declare module "@oh-my-pi/pi-coding-agent" {
 	/** omp's session settings (opaque here; only passed back to omp). */
 	export type OmpSettings = object;
 
+	/** The part of omp's ToolSession a file tool's target parser reads. */
+	export interface FileToolSession {
+		cwd: string;
+		settings: OmpSettings;
+	}
+
+	/** A tool's `approvalCacheTargets`: absolute paths, `tree\0<dir>/` for a recursive search, or URLs. */
+	export type TargetParser = (args: unknown) => readonly string[] | undefined;
+
 	/** What omp passes a tool's approval function (AgentToolContext, the fields used here). */
 	export interface ApprovalContext {
 		settings?: OmpSettings;
@@ -82,9 +91,40 @@ declare module "@oh-my-pi/pi-coding-agent" {
 		): Promise<AgentToolResult>;
 	}
 
+	/** Fired for each tool call before it runs (for a batch: every call, before any runs). */
+	export interface ToolCallEvent {
+		type: "tool_call";
+		toolName: string;
+		toolCallId: string;
+		input: Record<string, unknown>;
+	}
+
+	export interface ToolCallEventResult {
+		/** Refuse the call; `reason` is returned to the model as the error. */
+		block?: boolean;
+		reason?: string;
+	}
+
+	/** Fired after a tool ran, before the next tool of the turn starts. */
+	export interface ToolResultEvent {
+		type: "tool_result";
+		toolName: string;
+		toolCallId: string;
+		input: Record<string, unknown>;
+		content: ToolResultContent[];
+		isError: boolean;
+	}
+
+	export interface ToolResultEventResult {
+		content?: ToolResultContent[];
+		isError?: boolean;
+	}
+
 	export interface ExtensionAPI {
 		readonly zod: Zod;
 		registerTool<TParams>(tool: ToolDefinition<TParams>): void;
+		on(event: "tool_call", handler: (event: ToolCallEvent) => Promise<ToolCallEventResult | undefined>): void;
+		on(event: "tool_result", handler: (event: ToolResultEvent) => Promise<ToolResultEventResult | undefined>): void;
 	}
 }
 
@@ -104,6 +144,57 @@ declare module "@oh-my-pi/pi-coding-agent/config/settings" {
 	export class Settings {
 		/** The process settings (omp's main session uses this object). */
 		static get instance(): OmpSettings;
+	}
+}
+
+// omp's file tools, constructed here only for `approvalCacheTargets`, which reads the session's cwd and settings.
+declare module "@oh-my-pi/pi-coding-agent/tools/read" {
+	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
+	export class ReadTool {
+		constructor(session: FileToolSession);
+		readonly approvalCacheTargets: TargetParser;
+	}
+}
+declare module "@oh-my-pi/pi-coding-agent/tools/write" {
+	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
+	export class WriteTool {
+		constructor(session: FileToolSession);
+		readonly approvalCacheTargets: TargetParser;
+	}
+}
+declare module "@oh-my-pi/pi-coding-agent/edit" {
+	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
+	export class EditTool {
+		constructor(session: FileToolSession);
+		readonly approvalCacheTargets: TargetParser;
+	}
+}
+declare module "@oh-my-pi/pi-coding-agent/tools/grep" {
+	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
+	export class GrepTool {
+		constructor(session: FileToolSession);
+		readonly approvalCacheTargets: TargetParser;
+	}
+}
+declare module "@oh-my-pi/pi-coding-agent/tools/glob" {
+	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
+	export class GlobTool {
+		constructor(session: FileToolSession);
+		readonly approvalCacheTargets: TargetParser;
+	}
+}
+declare module "@oh-my-pi/pi-coding-agent/tools/jfind/index" {
+	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
+	export class FindTool {
+		constructor(session: FileToolSession);
+		readonly approvalCacheTargets: TargetParser;
+	}
+}
+declare module "@oh-my-pi/pi-coding-agent/tools/ast-grep" {
+	import type { FileToolSession, TargetParser } from "@oh-my-pi/pi-coding-agent";
+	export class AstGrepTool {
+		constructor(session: FileToolSession);
+		readonly approvalCacheTargets: TargetParser;
 	}
 }
 

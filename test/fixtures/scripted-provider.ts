@@ -2,7 +2,9 @@
 // integration test can drive the installed omp with no model and no spend.
 // The script is a JSON array of tool calls in OMP_SANDBOX_SCRIPT (each item
 // { "name": "bash", "arguments": { ... } }); after the last result it answers
-// "SCRIPT-DONE".
+// "SCRIPT-DONE". In string arguments, "{{TAG}}" becomes the snapshot tag of the
+// last `[file#TAG]` header in the previous tool result, so a script can `edit`
+// what it just read.
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 
 interface ScriptedCall {
@@ -12,6 +14,7 @@ interface ScriptedCall {
 
 interface ScriptedMessage {
 	role: string;
+	content?: unknown;
 }
 
 interface ScriptedContext {
@@ -48,9 +51,14 @@ export default function scriptedProvider(pi: ProviderAPI): void {
 			queueMicrotask(() => {
 				const step = script[done];
 				if (step !== undefined) {
-					const call = { type: "toolCall", id: `call_${done}`, name: step.name, arguments: step.arguments };
+					const tag = lastTag(context.messages.filter(m => m.role === "toolResult").at(-1));
+					const args = JSON.parse(JSON.stringify(step.arguments).replaceAll("{{TAG}}", tag ?? "NO-TAG"));
+					const call = { type: "toolCall", id: `call_${done}`, name: step.name, arguments: args };
 					const message = { ...base, content: [call], stopReason: "toolUse" };
 					stream.push({ type: "start", partial: message });
+					// Tools such as edit read their input from the streamed arguments, not only the final call.
+					stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+					stream.push({ type: "toolcall_delta", contentIndex: 0, delta: JSON.stringify(args), partial: message });
 					stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: call, partial: message });
 					stream.push({ type: "done", reason: "toolUse", message });
 				} else {
@@ -74,4 +82,10 @@ export default function scriptedProvider(pi: ProviderAPI): void {
 			},
 		],
 	});
+}
+
+function lastTag(message: ScriptedMessage | undefined): string | undefined {
+	const parts = Array.isArray(message?.content) ? (message.content as { text?: string }[]) : [];
+	const text = parts.map(part => part.text ?? "").join("");
+	return [...text.matchAll(/\[[^\]\n]*#([0-9A-Z]{4})\]/g)].at(-1)?.[1];
 }
