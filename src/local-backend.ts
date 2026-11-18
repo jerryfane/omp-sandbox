@@ -452,9 +452,17 @@ function canCreatePidNamespace(): boolean {
 	return pidNamespaceSupport;
 }
 
-function namespaceFlags(): string[] {
-	const user = process.getuid?.() === 0 ? [] : ["--user", "--map-root-user"];
-	return [...user, "--pid", "--fork", "--kill-child"];
+/**
+ * Always a user namespace too, also when running as root, so the namespace
+ * never holds real root (machine rule: no real-root namespace experiments on
+ * live hosts). Run as root, the namespace's uid 0 still maps to the real uid
+ * 0, so root-owned files stay accessible, but its capabilities are confined to
+ * the new namespaces. Never a mount namespace or a /proc remount.
+ */
+const NAMESPACE_FLAGS: readonly string[] = ["--user", "--map-root-user", "--pid", "--fork", "--kill-child"];
+
+function namespaceFlags(): readonly string[] {
+	return NAMESPACE_FLAGS;
 }
 
 /**

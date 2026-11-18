@@ -30,7 +30,9 @@ Every path a backend takes is an absolute path *inside the sandbox*. Translating
   - A concurrent rename cannot redirect an operation, because each step uses the directory already opened, not a name looked up again.
   - Tests use this to prove a tool never touches a host file.
 - **`exec` is a host subprocess and is not confined.** It exists to exercise the tools without a VM.
-  - **Containment `"full"`** runs each command in its own pid namespace (`unshare --pid --fork --kill-child`), under a small Python init.
+  - **Containment `"full"`** runs each command in its own user and pid namespace (`unshare --user --map-root-user --pid --fork --kill-child`), under a small Python init.
+    - The user namespace is always used, also when running as root, so the namespace never holds real root. As root, its uid 0 still maps to the real uid 0: root-owned files stay accessible, but capabilities are confined to the new namespaces.
+    - No mount namespace and no `/proc` remount.
     - The command itself is not PID 1, so `$$` is 2 and signals behave normally.
     - A command that dies of a signal is reported as that signal, not as exit 128+n. The init passes it over a private pipe and adds nothing to the command's output.
     - It needs `unshare` and `python3`, and is picked when both work: as root, or as a user allowed to create user namespaces.

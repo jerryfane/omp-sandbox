@@ -79,15 +79,20 @@ const probe = await LocalBackend.create(os.tmpdir()).catch(() => undefined);
 const fullSupported = probe?.containment === "full";
 await probe?.close();
 if (fullSupported) modes.push({ containment: "full" as const });
-else console.warn("omp-sandbox: no pid namespace here (unshare failed); 'full' containment tests are skipped");
+else {
+	console.warn(
+		"omp-sandbox: this host cannot create a user+pid namespace, so the 'full' containment tests are skipped. " +
+			"Run them where unprivileged user namespaces are allowed, or in a throwaway VM or container.",
+	);
+}
 
-// Whether this host can create a pid namespace at all, checked without
+// Whether this host can create a user+pid namespace at all, checked without
 // LocalBackend's init. Where it can, "full" being unavailable is a
 // LocalBackend bug (a broken init), not a host limit, and must fail instead
-// of silently skipping the full-mode tests.
-const unshareArgs = process.getuid?.() === 0 ? [] : ["--user", "--map-root-user"];
+// of silently skipping the full-mode tests. Always with a user namespace, as
+// LocalBackend does: never a real-root namespace.
 const hostCanUnshare =
-	Bun.spawnSync(["unshare", ...unshareArgs, "--pid", "--fork", "--kill-child", "--", "true"]).exitCode === 0;
+	Bun.spawnSync(["unshare", "--user", "--map-root-user", "--pid", "--fork", "--kill-child", "--", "true"]).exitCode === 0;
 test.if(hostCanUnshare)("full containment is available wherever the host can create a pid namespace", () => {
 	expect(fullSupported).toBe(true);
 });
@@ -197,6 +202,14 @@ describe.each(modes)("exec, containment $containment", ({ containment }) => {
 		const result = await local.exec(`setsid sleep ${escaped} & echo started`, { cwd: local.root });
 		expect(result.exitCode).toBe(0);
 		expect(await survivorsOf(escaped)).toEqual([]);
+	});
+
+	test.if(containment === "full")("full containment runs in its own user namespace, never as real root", async () => {
+		const host = await fs.readlink("/proc/self/ns/user");
+		const result = await local.exec("readlink /proc/self/ns/user", { cwd: local.root });
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.trim()).toMatch(/^user:\[\d+\]$/);
+		expect(result.stdout.trim()).not.toBe(host);
 	});
 
 	test("a command ended by a signal reports that signal, with nothing added to stderr", async () => {
