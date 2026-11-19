@@ -117,4 +117,31 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		expect(slow.exitCode).toBeNull();
 		expect(slow.signal).not.toBeNull();
 	}, 60_000);
+
+	test("the real CLI keeps a cwd name with leading or trailing spaces, and a startup timeout is a timeout", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		for (const name of [" leading", "trailing "]) {
+			await fs.mkdir(path.join(backend.root, name));
+			const result = await backend.exec("pwd", { cwd: path.join(backend.root, name) });
+			expect(result.stdout).toBe(`${path.join(backend.root, name)}\n`);
+		}
+		for (const timeoutMs of [0, 1]) {
+			const result = await backend.exec("sleep 30", { cwd: backend.root, timeoutMs });
+			expect(result.timedOut).toBe(true);
+		}
+		const exited = await backend.exec("exit 143", { cwd: backend.root });
+		expect(exited.exitCode).toBe(143);
+		expect(exited.signal).toBeNull();
+	}, 60_000);
+
+	test("containment is the process group: a setsid descendant outlives a timeout, as process-group says", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		expect(backend.containment).toBe("process-group");
+		const result = await backend.exec("setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $!; sleep 30", { cwd: backend.root, timeoutMs: 1000 });
+		expect(result.timedOut).toBe(true);
+		const pid = Number.parseInt(result.stdout.trim(), 10);
+		// provider=local runs on this host, so the descendant is visible here; stop it.
+		expect(() => process.kill(pid, 0)).not.toThrow();
+		process.kill(pid, "SIGKILL");
+	}, 60_000);
 });

@@ -44,7 +44,7 @@ describe("GitmootBackend", () => {
 	test("open reads the workspace's root from `workspace show`", async () => {
 		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
 		expect(backend.root).toBe(root);
-		expect(backend.containment).toBe("full");
+		expect(backend.containment).toBe("process-group");
 	});
 
 	test("open refuses a workspace that is not ready, and reports the CLI's own errors", async () => {
@@ -125,6 +125,45 @@ describe("GitmootBackend", () => {
 		await Bun.sleep(500);
 		expect(await Bun.file(path.join(root, "late")).exists()).toBe(false);
 	}, 20_000);
+
+	test("an abort right after calling exec, during setup, still cancels: the command never runs", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		const controller = new AbortController();
+		const pending = backend.exec(`sleep 0.3; touch ${path.join(root, "ran")}`, { cwd: root, signal: controller.signal });
+		controller.abort();
+		const result = await pending;
+		expect(result.aborted).toBe(true);
+		expect(result.exitCode).toBeNull();
+		await Bun.sleep(600);
+		expect(await Bun.file(path.join(root, "ran")).exists()).toBe(false);
+	});
+
+	test("a timeout that ends the CLI before it writes a status is reported as the timeout, not a failure", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		for (const timeoutMs of [0, 1]) {
+			const result = await backend.exec("sleep 30", { cwd: root, timeoutMs });
+			expect(result.timedOut).toBe(true);
+			expect(result.exitCode).toBeNull();
+		}
+	});
+
+	test("a command's own exit 143 is an exit code, not a signal", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		const result = await backend.exec("exit 143", { cwd: root });
+		expect(result.exitCode).toBe(143);
+		expect(result.signal).toBeNull();
+	});
+
+	test("a cwd whose name begins or ends with a space is kept, in exec and in the shell line", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		for (const name of [" leading", "trailing ", " both "]) {
+			await fs.mkdir(path.join(root, name));
+			const result = await backend.exec("pwd", { cwd: path.join(root, name) });
+			expect(result.stdout).toBe(`${path.join(root, name)}\n`);
+			const line = await runLine(backend.shellCommand("pwd", { cwd: path.join(root, name) }));
+			expect(line.stdout).toBe(`${path.join(root, name)}\n`);
+		}
+	});
 
 	test("exec stops capturing at maxOutputBytes, and a gitmoot failure rejects with its code", async () => {
 		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });

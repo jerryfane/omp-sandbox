@@ -18,7 +18,8 @@
  *     its base environment; nothing from the host.
  *   - SIGINT/SIGTERM to the CLI reaches the command's whole process group;
  *     if the CLI dies outright the VM-side watchdog kills the group within
- *     15 s. That is the "full" containment here, with that delay.
+ *     15 s. Only that group: a descendant that called `setsid` survives, so
+ *     the containment here is "process-group".
  *   - When the CLI itself fails it exits 125 and prints
  *     {"error":{"code","message"}} on stderr.
  */
@@ -74,8 +75,8 @@ export interface GitmootBackendOptions {
 export class GitmootBackend {
 	readonly name = "gitmoot";
 	readonly root: string;
-	/** The VM-side watchdog ends everything a command started, within 15 s of its CLI process dying. */
-	readonly containment = "full" as const;
+	/** gitmoot's supervisor and watchdog kill the command's process group (within 15 s if the CLI dies), nothing outside it. */
+	readonly containment = "process-group" as const;
 	readonly bin: string;
 	readonly workspace: string;
 	readonly home: string | undefined;
@@ -147,16 +148,26 @@ export class GitmootBackend {
 			envArgs.push("--env", `${name}=${value}`);
 		}
 		const result: ExecResult = { exitCode: null, signal: null, stdout: "", stderr: "", truncated: false, timedOut: false, aborted: false };
-		if (options.signal?.aborted) {
-			result.aborted = true;
-			return result;
-		}
 		const limit = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-		const statusDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sandbox-gitmoot-"));
-		const statusFile = path.join(statusDir, "status.json");
+		// Cancellation is tracked from the start, so an abort or timeout during setup is never lost.
+		let child: ReturnType<typeof spawn> | undefined;
+		const cancel = (why: "timedOut" | "aborted") => {
+			result[why] = true;
+			child?.kill("SIGTERM");
+		};
+		const onAbort = () => cancel("aborted");
+		if (options.signal?.aborted) onAbort();
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		const timer = options.timeoutMs === undefined ? undefined : setTimeout(() => cancel("timedOut"), options.timeoutMs);
+		let statusDir: string | undefined;
 		try {
+			if (result.aborted || result.timedOut) return result;
+			statusDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sandbox-gitmoot-"));
+			if (result.aborted || result.timedOut) return result;
+			const statusFile = path.join(statusDir, "status.json");
 			const args = ["workspace", "exec", this.workspace, ...homeArgs(this.home), "--cwd", relative, ...envArgs, "--status-file", statusFile, "--", "/bin/bash", "-c", command];
-			const child = spawn(this.bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+			const spawned = spawn(this.bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+			child = spawned;
 			const capture = (stream: OutputStream) => {
 				const decoder = new TextDecoder();
 				let bytes = 0;
@@ -174,37 +185,41 @@ export class GitmootBackend {
 					options.onOutput?.(text, stream);
 				};
 			};
-			child.stdout.on("data", capture("stdout"));
-			child.stderr.on("data", capture("stderr"));
-			const stop = () => child.kill("SIGTERM");
-			const timer = options.timeoutMs === undefined ? undefined : setTimeout(() => ((result.timedOut = true), stop()), options.timeoutMs);
-			const onAbort = () => ((result.aborted = true), stop());
-			options.signal?.addEventListener("abort", onAbort, { once: true });
-			let code: number | null;
-			try {
-				code = await new Promise<number | null>((resolve, reject) => {
-					child.once("error", reject);
-					child.once("close", resolve);
-				});
-			} finally {
-				clearTimeout(timer);
-				options.signal?.removeEventListener("abort", onAbort);
-			}
+			spawned.stdout?.on("data", capture("stdout"));
+			spawned.stderr?.on("data", capture("stderr"));
+			const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+				spawned.once("error", reject);
+				spawned.once("close", (code, signal) => resolve({ code, signal }));
+			});
 			const status = await readStatus(statusFile);
-			if (status === undefined) throw new Error(`gitmoot workspace exec exited ${code} without a status file: ${result.stderr.trim().slice(0, 300)}`);
+			if (status === undefined) {
+				// Ended by our own SIGTERM before gitmoot wrote a status (it had not installed its
+				// handler yet): the cancellation the caller asked for, not a gitmoot failure.
+				if ((result.timedOut || result.aborted) && exit.signal !== null) {
+					result.signal = exit.signal;
+					return result;
+				}
+				throw new Error(`gitmoot workspace exec exited ${exit.code ?? exit.signal} without a status file: ${result.stderr.trim().slice(0, 300)}`);
+			}
 			if (status.error !== null) throw new GitmootCliError("workspace exec", status.error.code, status.error.message);
 			if (status.signal !== null) result.signal = SIGNAL_NAMES.get(status.signal) ?? `SIG${status.signal}`;
 			else result.exitCode = status.exit_code;
 			return result;
 		} finally {
-			await fs.rm(statusDir, { recursive: true, force: true });
+			clearTimeout(timer);
+			options.signal?.removeEventListener("abort", onAbort);
+			if (statusDir !== undefined) await fs.rm(statusDir, { recursive: true, force: true });
 		}
 	}
 
 	/** Nothing to release: each CLI call is its own connection. The workspace stays. */
 	async close(): Promise<void> {}
 
-	/** `cwd` relative to the root ("." for the root); refuses a path outside it. */
+	/**
+	 * `cwd` relative to the root, as `./<path>/.` ("." for the root), so the
+	 * CLI, which trims whitespace around `--cwd`, keeps a name that begins or
+	 * ends with a space. Refuses a path outside the root.
+	 */
 	#relative(cwd: string): string {
 		if (!path.posix.isAbsolute(cwd) || cwd.includes("\0")) throw new BackendError("INVALID_PATH", cwd, `sandbox paths must be absolute: ${cwd}`);
 		const relative = path.posix.relative(this.root, path.posix.normalize(cwd));
@@ -212,7 +227,7 @@ export class GitmootBackend {
 		if (relative === ".." || relative.startsWith("../") || path.posix.isAbsolute(relative)) {
 			throw new BackendError("OUTSIDE_ROOT", cwd, `path is outside the sandbox root: ${cwd}`);
 		}
-		return relative;
+		return `./${relative}/.`;
 	}
 }
 

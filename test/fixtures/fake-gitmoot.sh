@@ -10,6 +10,7 @@
 #   FAKE_GITMOOT_STATE  the state `show` reports (default ready)
 set -u
 id=${FAKE_GITMOOT_ID:-ws-test}
+RUNNER="$(dirname -- "$(readlink -f -- "$0")")/fake-gitmoot-run.py"
 status_file=
 write_status() { # exit_code signal-or-null error-json-or-null
 	[ -n "$status_file" ] || return 0
@@ -46,10 +47,7 @@ case "${1-} ${2-}" in
 	dir="$FAKE_GITMOOT_ROOT/$cwd"
 	[ -d "$dir" ] || fail invalid_args "no directory $cwd"
 	cd "$dir" || fail internal "cd"
-	/usr/bin/env -i HOME="$FAKE_GITMOOT_ROOT" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 GITMOOT_WORKSPACE_ROOT="$FAKE_GITMOOT_ROOT" /bin/bash -lc "$1" </dev/null
-	status=$?
-	if [ $status -gt 128 ]; then write_status null $((status - 128)) null; else write_status $status null null; fi
-	exit $status
+	exec /usr/bin/python3 "$RUNNER" "${status_file:--}" /usr/bin/env -i HOME="$FAKE_GITMOOT_ROOT" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 GITMOOT_WORKSPACE_ROOT="$FAKE_GITMOOT_ROOT" /bin/bash -lc "$1" </dev/null
 	;;
 "workspace exec")
 	[ "${3-}" = "$id" ] || fail not_found "no workspace ${3-}"
@@ -72,15 +70,9 @@ case "${1-} ${2-}" in
 	dir="$FAKE_GITMOOT_ROOT/$cwd"
 	[ -d "$dir" ] || fail invalid_args "no directory $cwd"
 	cd "$dir" || fail internal "cd"
-	# Own session and process group, so SIGTERM to the CLI can reach the whole group (as documented).
-	/usr/bin/setsid /usr/bin/env -i HOME="$FAKE_GITMOOT_ROOT" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "${envs[@]}" "$@" </dev/null &
-	pid=$!
-	trap 'kill -TERM -- -$pid 2>/dev/null; (sleep 3; kill -KILL -- -$pid 2>/dev/null) &' TERM INT
-	wait $pid
-	status=$?
-	while kill -0 $pid 2>/dev/null; do wait $pid; status=$?; done
-	if [ $status -gt 128 ]; then write_status null $((status - 128)) null; else write_status $status null null; fi
-	exit $status
+	# The runner puts the command in its own process group, forwards SIGTERM/SIGINT to that
+	# group (SIGKILL 3 s later), and writes the status file from the real wait status.
+	exec /usr/bin/python3 "$RUNNER" "${status_file:--}" /usr/bin/env -i HOME="$FAKE_GITMOOT_ROOT" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "${envs[@]}" "$@" </dev/null
 	;;
 *)
 	fail invalid_args "fake gitmoot does not implement: $*"

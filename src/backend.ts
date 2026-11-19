@@ -22,9 +22,8 @@ export interface ExecOptions {
 	 */
 	env?: Record<string, string>;
 	/**
-	 * Kill the command after this many ms. A kill reaches every process the
-	 * command started, including ones that moved to another session or
-	 * process group (`setsid`). See Backend.containment for the guarantee.
+	 * Kill the command after this many ms. How far the kill reaches (the whole
+	 * tree, or only the command's process group) is Backend.containment.
 	 */
 	timeoutMs?: number;
 	/** Aborting kills the command the same way a timeout does. */
@@ -134,14 +133,17 @@ export interface Backend {
 	/** Absolute sandbox path of the workspace root. */
 	readonly root: string;
 	/**
-	 * How exec contains what a command starts. "full": every descendant is
-	 * killed on timeout or abort, and processes still running when the
-	 * command's shell exits are killed then. "process-tree": the kill reaches
-	 * every descendant still linked to the command, but one whose parent has
-	 * already exited, and anything left running after the shell exits,
-	 * survives.
+	 * How exec contains what a command starts, strongest first. "full": every
+	 * descendant is killed on timeout or abort, and processes still running
+	 * when the command's shell exits are killed then. "process-tree": the kill
+	 * reaches every descendant still linked to the command, but one whose
+	 * parent has already exited, and anything left running after the shell
+	 * exits, survives. "process-group": the kill reaches the command's process
+	 * group only; a descendant that moved to another group or session
+	 * (`setsid`) survives, and so does anything left running after the shell
+	 * exits.
 	 */
-	readonly containment: "full" | "process-tree";
+	readonly containment: "full" | "process-tree" | "process-group";
 	/**
 	 * Run a shell command (`bash -c <command>`) in the sandbox. stdout and
 	 * stderr carry only the command's own output; the backend adds nothing.
@@ -160,9 +162,9 @@ export interface Backend {
 	 *   run them inside its own process;
 	 * - does not start with `cd` (omp rewrites a leading `cd x &&`).
 	 *
-	 * When the caller kills the process it started for the line, everything
-	 * the command started must die too: the backend's containment guarantee
-	 * applies, for a gitmoot workspace through its exec watchdog.
+	 * When the caller kills the process it started for the line, what the
+	 * command started is ended as far as the backend's containment reaches;
+	 * for a gitmoot workspace, through its exec watchdog.
 	 *
 	 * Synchronous and side-effect free: it only builds the string. It throws a
 	 * BackendError for a cwd outside the root or an invalid environment name.
