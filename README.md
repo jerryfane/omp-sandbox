@@ -4,7 +4,7 @@ An [omp](https://github.com/can1357/oh-my-pi) add-on that runs an agent's tools 
 
 It re-registers omp's built-in `bash` under the same name and forwards each call to a **backend**: the place where commands run and files live. omp's own file tools work on a host copy of the sandbox's files that the add-on keeps in sync. The agent's session, pane, messages and model calls stay local. Its checkout, builds and tests run in the sandbox.
 
-> **Status: prototype, private.** Steps 1, 2a and 2b of the plan below: the backend interface, a local stand-in backend, the `bash` replacement and the synced file tools. Not yet checked: subagents (`task` is refused), and the sync over a real remote backend (step 3/4). Do not install this for a live agent yet.
+> **Status: prototype.** Steps 1–4 of the plan below are done: the backend interface, a local stand-in backend, the `bash` replacement, the synced file tools, and the `gitmoot workspace` backend, checked end to end on an E2B workspace. Not yet supported: subagents (`task` is refused), and ssh or docker backends. Do not install this for a live agent yet.
 
 ## Why
 Design: gitmoot/gitmoot#2678, option (c). omp's built-in tools run inside the omp process, through the embedded bash engine and in-process file tools. A `shellPath` wrapper cannot move them, so the tools themselves are replaced.
@@ -121,9 +121,10 @@ The sandbox is a gitmoot remote workspace (gitmoot/gitmoot#2678): a VM bound to 
 ## Development
 ```sh
 bun install
-bun test          # unit tests (Linux; they use /proc) and, when omp is installed,
-                  # an integration test that runs it with a scripted provider (no model, no spend)
+bun test          # unit tests (Linux; they use /proc) and, when omp is on PATH (or OMP_BIN names it),
+                  # integration tests that run it with a scripted provider (no model, no spend)
 bunx tsc --noEmit # typecheck
+GITMOOT_WS_BIN=/abs/path/to/gitmoot bun test test/gitmoot-real.test.ts   # against a real gitmoot build
 ```
 
 ## Plan
@@ -133,8 +134,8 @@ One PR per step, each independently reviewed at its exact head before merge.
 2. **2a:** the `bash` replacement. *(done, #3)*
    **2b:** the file tools, on a host copy kept in sync with the sandbox, so omp's own tools and their snapshot tags keep working; `eval`, `debug`, `lsp`, `task` and `ast_edit` refused. *(done, #5 and #6)*
 3. A prototype in a throwaway omp agent dir, driven by a scripted provider (no model tokens). It answers whether approvals (interactive prompts) and the output minimizer still work with replaced tools, what other paths to host execution remain (`!` commands, xd:// devices, MCP, plugins), and how fast the sync is at repo size. *(done; answers above and on gitmoot#2678)*
-4. The `gitmoot workspace` backend. **4a:** commands (`open`, `ws sh`, `exec`) against gitmoot's slice 1. *(done, #8)* **4b:** files and sync against slice 2, and `OMP_SANDBOX_BACKEND=gitmoot`. *(this PR)*
-5. ssh and docker backends. The repo goes public after the prototype passes and an independent review.
+4. The `gitmoot workspace` backend. **4a:** commands (`open`, `ws sh`, `exec`) against gitmoot's slice 1. *(done, #8)* **4b:** files and sync against slice 2, and `OMP_SANDBOX_BACKEND=gitmoot`. *(done, #10)* **4c:** slice 2 as merged: plain `--cwd`, `.git` at any depth never mirrored. *(done, #11)*
+5. ssh and docker backends.
 
 ## Safety
 **Never install this into `~/.omp/agent/extensions`.** Every omp session for that user loads that directory. Load it explicitly instead, with `omp --extension <path>` or `--trusted-extension <abs-path>`.

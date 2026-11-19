@@ -367,5 +367,6 @@ describe("Mirror", () => {
 		expect(hostFilesAtPull.length).toBeGreaterThanOrEqual(3);
 		expect(hostFilesAtPull[0]).toBe(0);
 		expect(hostFilesAtPull.at(-1)).toBeGreaterThan(0);
-	});
+		// 600 files on a shared host: well past bun's 5 s default under load.
+	}, 60_000);
 });

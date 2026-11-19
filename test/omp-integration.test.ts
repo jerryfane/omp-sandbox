@@ -8,8 +8,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const OMP = process.env.OMP_BIN ?? "/root/.local/bin/omp";
-const ompInstalled = await Bun.file(OMP).exists();
+const OMP = process.env.OMP_BIN || Bun.which("omp") || "";
+const ompInstalled = OMP !== "" && (await Bun.file(OMP).exists());
 
 interface ToolEnd {
 	toolCallId: string;
