@@ -373,7 +373,7 @@ export class Mirror {
 		const found = new Map<string, Scanned>();
 		const walk = async (dir: string, rel: string): Promise<void> => {
 			for (const name of await fs.readdir(dir)) {
-				if (rel === "" && name === ".git") continue;
+				if (isGitName(name)) continue;
 				const childRel = rel === "" ? name : `${rel}/${name}`;
 				const info = await lstatOrUndefined(path.join(dir, name));
 				if (info === undefined) continue;
@@ -449,8 +449,13 @@ function relativeParts(rel: string): string[] {
 	if (rel === "" || rel.includes("\0") || parts.some(part => part === "" || part === "." || part === "..")) {
 		throw new MirrorError(`invalid workspace path from the sandbox: ${JSON.stringify(rel)}`);
 	}
-	if (parts[0] === ".git") throw new MirrorError(`.git is not mirrored: ${rel}`);
+	if (parts.some(isGitName)) throw new MirrorError(`.git is not mirrored: ${rel}`);
 	return parts;
+}
+
+/** `.git` in any letter case: gitmoot never lists, pulls, pushes or removes one, at any depth. */
+function isGitName(name: string): boolean {
+	return name.toLowerCase() === ".git";
 }
 
 function fileFingerprint(info: Stats): string {

@@ -128,7 +128,7 @@ export class GitmootBackend implements Backend {
 	 * the VM never receives the host's environment.
 	 */
 	shellCommand(command: string, options: { cwd: string; env?: Record<string, string> }): string {
-		const relative = this.#relative(options.cwd);
+		const relative = this.#rel(options.cwd);
 		let script = command;
 		const exports: string[] = [];
 		for (const [name, value] of Object.entries(options.env ?? {})) {
@@ -160,7 +160,7 @@ export class GitmootBackend implements Backend {
 	 * rejects with GitmootCliError instead of returning a result.
 	 */
 	async exec(command: string, options: ExecOptions): Promise<ExecResult> {
-		const relative = this.#relative(options.cwd);
+		const relative = this.#rel(options.cwd);
 		const envArgs: string[] = [];
 		for (const [name, value] of Object.entries(options.env ?? {})) {
 			if (!ENV_NAME.test(name) || value.includes("\0")) {
@@ -381,16 +381,6 @@ export class GitmootBackend implements Backend {
 		const error = cliError(label, result.stderr);
 		if (error instanceof GitmootCliError && error.code === "cwd_outside_root") return new BackendError("SYMLINK", file, error.message);
 		return error;
-	}
-
-	/**
-	 * `cwd` relative to the root, as `./<path>/.` ("." for the root), so the
-	 * CLI, which trims whitespace around `--cwd`, keeps a name that begins or
-	 * ends with a space. Refuses a path outside the root.
-	 */
-	#relative(cwd: string): string {
-		const relative = this.#rel(cwd);
-		return relative === "" ? "." : `./${relative}/.`;
 	}
 }
 

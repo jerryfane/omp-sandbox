@@ -86,6 +86,27 @@ describe("Mirror", () => {
 		expect((await fs.stat(path.join(host, "bin/run.sh"))).mode & 0o777).toBe(0o755);
 	});
 
+	test("no .git at any depth crosses in either direction", async () => {
+		await put(sandbox, "lib/.git/HEAD", "ref");
+		await put(sandbox, "lib/x.txt", "x");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual(["lib/", "lib/x.txt=x"]);
+		await tick();
+		await put(host, "lib/.git/config", "host-made");
+		await put(host, "sub/.git", "gitdir: elsewhere\n");
+		await put(host, "up/.GIT/config", "case");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(sandbox, "lib/.git/HEAD"), "utf8")).toBe("ref");
+		expect(await Bun.file(path.join(sandbox, "lib/.git/config")).exists()).toBe(false);
+		expect(await Bun.file(path.join(sandbox, "sub/.git")).exists()).toBe(false);
+		expect(await Bun.file(path.join(sandbox, "up/.GIT/config")).exists()).toBe(false);
+		// The copy stays usable: an ordinary edit still syncs.
+		await put(host, "lib/x.txt", "x2");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(sandbox, "lib/x.txt"), "utf8")).toBe("x2");
+	});
+
 	test("refuses to start on a host directory that is not empty", async () => {
 		await put(host, "stray.txt", "x");
 		await expect(Mirror.create(backend, host)).rejects.toThrow(MirrorError);
