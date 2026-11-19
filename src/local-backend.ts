@@ -53,6 +53,30 @@ const O_CREATE_NEW = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL |
 const MAX_TOKENS = 8;
 
 /**
+ * A file whose ctime is this close to (or after) the moment a manifest was
+ * taken may still change without its metadata changing: ctime advances on a
+ * coarse kernel clock, so a second same-size write that restores the mtime
+ * within one tick leaves size, mtime, ctime and inode all equal (measured:
+ * 125 of 200 back-to-back edits on ext4). Such entries are reported as
+ * changed by the next `changes` call, whatever their fingerprint, the way git
+ * treats "racily clean" files; a caller that compares contents loses nothing.
+ */
+const RACY_MS = 1000;
+
+interface Manifest {
+	/** When the walk that produced it started (Date.now()). */
+	startedAt: number;
+	entries: Map<string, { fingerprint: string; ctimeMs: number }>;
+}
+
+/** Whether `rel` differs from `previous`: a new or different fingerprint, or racily recorded there. */
+function isChangedSince(previous: Manifest, rel: string, fingerprint: string): boolean {
+	const recorded = previous.entries.get(rel);
+	if (recorded === undefined || recorded.fingerprint !== fingerprint) return true;
+	return !fingerprint.startsWith("dir:") && recorded.ctimeMs >= previous.startedAt - RACY_MS;
+}
+
+/**
  * The pid-namespace "init" (PID 1), a small Python program. It runs the
  * command as its child, so the command is not PID 1 and keeps normal signal
  * behaviour, reaps orphans, and exits with the command's status. When it
@@ -161,7 +185,7 @@ export class LocalBackend implements Backend {
 	readonly containment: "full" | "process-tree";
 	readonly #rootDir: FileHandle;
 	/** Tree fingerprints by `changes` token, oldest first. */
-	readonly #manifests = new Map<string, Map<string, string>>();
+	readonly #manifests = new Map<string, Manifest>();
 
 	private constructor(root: string, rootDir: FileHandle, containment: "full" | "process-tree") {
 		this.root = root;
@@ -439,7 +463,8 @@ export class LocalBackend implements Backend {
 	}
 
 	async changes(since?: string): Promise<Changes> {
-		const entries = new Map<string, { entry: TreeEntry; fingerprint: string }>();
+		const startedAt = Date.now();
+		const entries = new Map<string, { entry: TreeEntry; fingerprint: string; ctimeMs: number }>();
 		const walk = async (dirFd: number, rel: string): Promise<void> => {
 			let names: string[];
 			try {
@@ -462,7 +487,7 @@ export class LocalBackend implements Backend {
 				// A directory's size and mtime move with its children; only its identity and mode matter.
 				const fingerprint =
 					type === "dir" ? `dir:${info.ino}:${entry.mode}` : `${type}:${info.size}:${info.mtimeMs}:${info.ctimeMs}:${info.ino}:${entry.mode}`;
-				entries.set(childRel, { entry, fingerprint });
+				entries.set(childRel, { entry, fingerprint, ctimeMs: info.ctimeMs });
 				if (type !== "dir") continue;
 				// Same rule as list: re-opened with O_NOFOLLOW, and not entered when it changed meanwhile.
 				const child = await fs.open(at(dirFd, name), O_DIR).catch((error: unknown) => {
@@ -484,8 +509,8 @@ export class LocalBackend implements Backend {
 			await rootHandle.close();
 		}
 
-		const current = new Map<string, string>();
-		for (const [rel, { fingerprint }] of entries) current.set(rel, fingerprint);
+		const current: Manifest = { startedAt, entries: new Map() };
+		for (const [rel, { fingerprint, ctimeMs }] of entries) current.entries.set(rel, { fingerprint, ctimeMs });
 		const previous = since === undefined ? undefined : this.#manifests.get(since);
 		const token = randomUUID();
 		this.#manifests.set(token, current);
@@ -494,8 +519,8 @@ export class LocalBackend implements Backend {
 			this.#manifests.delete(old);
 		}
 		const all = [...entries.values()];
-		const changed = (previous === undefined ? all : all.filter(({ entry, fingerprint }) => previous.get(entry.path) !== fingerprint)).map(e => e.entry);
-		const deleted = previous === undefined ? [] : [...previous.keys()].filter(rel => !current.has(rel));
+		const changed = (previous === undefined ? all : all.filter(({ entry, fingerprint }) => isChangedSince(previous, entry.path, fingerprint))).map(e => e.entry);
+		const deleted = previous === undefined ? [] : [...previous.entries.keys()].filter(rel => !current.entries.has(rel));
 		changed.sort((a, b) => byteOrder(a.path, b.path));
 		deleted.sort(byteOrder);
 		return { token, full: previous === undefined, changed, deleted };
