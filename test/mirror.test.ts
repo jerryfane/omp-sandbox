@@ -52,6 +52,27 @@ async function tick(): Promise<void> {
 	await new Promise(resolve => setTimeout(resolve, 20));
 }
 
+/** A Backend that forwards to the LocalBackend under test, with some methods replaced. */
+function delegating(overrides: Partial<Backend>): Backend {
+	return {
+		name: backend.name,
+		root: backend.root,
+		containment: backend.containment,
+		exec: (command, options) => backend.exec(command, options),
+		shellCommand: (command, options) => backend.shellCommand(command, options),
+		readFile: file => backend.readFile(file),
+		writeFile: (file, data, options) => backend.writeFile(file, data, options),
+		stat: file => backend.stat(file),
+		list: (dir, options) => backend.list(dir, options),
+		changes: since => backend.changes(since),
+		pull: paths => backend.pull(paths),
+		push: files => backend.push(files),
+		remove: paths => backend.remove(paths),
+		close: () => backend.close(),
+		...overrides,
+	};
+}
+
 describe("Mirror", () => {
 	test("the first pull copies files, directories and modes; never symlinks, special files or .git", async () => {
 		await put(sandbox, "a.txt", "A");
@@ -301,26 +322,29 @@ describe("Mirror", () => {
 		await put(sandbox, "x.txt", "x");
 		await put(sandbox, "y.txt", "y");
 		// A backend that forgets every token, like one that restarted.
-		const forgetful: Backend = {
-			name: backend.name,
-			root: backend.root,
-			containment: backend.containment,
-			exec: (command, options) => backend.exec(command, options),
-			shellCommand: (command, options) => backend.shellCommand(command, options),
-			readFile: file => backend.readFile(file),
-			writeFile: (file, data, options) => backend.writeFile(file, data, options),
-			stat: file => backend.stat(file),
-			list: (dir, options) => backend.list(dir, options),
-			changes: (): Promise<Changes> => backend.changes(undefined),
-			pull: paths => backend.pull(paths),
-			push: files => backend.push(files),
-			remove: paths => backend.remove(paths),
-			close: () => backend.close(),
-		};
+		const forgetful = delegating({ changes: (): Promise<Changes> => backend.changes(undefined) });
 		const mirror = await Mirror.create(forgetful, host);
 		await mirror.pullRemote();
 		await fs.rm(path.join(sandbox, "x.txt"));
 		await mirror.pullRemote();
 		expect(await tree(host)).toEqual(["y.txt=y"]);
+	});
+
+	test("a large fill writes each batch before pulling the next, so contents in memory stay bounded", async () => {
+		for (let i = 0; i < 600; i++) await put(sandbox, `many/f${String(i).padStart(4, "0")}.txt`, `content ${i}`);
+		const hostFilesAtPull: number[] = [];
+		const counting = delegating({
+			pull: async paths => {
+				hostFilesAtPull.push((await fs.readdir(path.join(host, "many")).catch(() => [])).length);
+				return backend.pull(paths);
+			},
+		});
+		const mirror = await Mirror.create(counting, host);
+		await mirror.pullRemote();
+		expect((await fs.readdir(path.join(host, "many"))).length).toBe(600);
+		// Three batches of at most 256: the later pulls start after earlier files were written.
+		expect(hostFilesAtPull.length).toBeGreaterThanOrEqual(3);
+		expect(hostFilesAtPull[0]).toBe(0);
+		expect(hostFilesAtPull.at(-1)).toBeGreaterThan(0);
 	});
 });
