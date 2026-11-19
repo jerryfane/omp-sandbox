@@ -11,6 +11,7 @@
  */
 import * as path from "node:path";
 import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
+import { splitDelimitedPathEntry } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 
 /**
  * The file tools that run on the host copy, one entry each: the only list.
@@ -93,10 +94,18 @@ const TREE_PREFIX = "tree\0";
 /**
  * Why a file-tool call must not run against the copy at `root`, or undefined
  * when every path it touches is inside it. Internal and web URLs are not
- * workspace paths and are left to the tool.
+ * workspace paths and are left to the tool. Run it right before the tool
+ * executes: how `read` splits a path list depends on which files exist.
  */
-export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unknown, root: string): string | undefined {
-	for (const target of tool.approvalCacheTargets(args) ?? []) {
+export async function refuseFileCall(tool: NativeFileTool, toolName: string, args: unknown, root: string): Promise<string | undefined> {
+	let targets: readonly string[];
+	try {
+		targets = await executionTargets(tool, toolName, args, root, 0);
+	} catch (error) {
+		if (error instanceof UnresolvedList) return `omp-sandbox: cannot tell which paths ${toolName} would read from ${JSON.stringify(error.entry)}; refusing it`;
+		throw error;
+	}
+	for (const target of targets) {
 		const file = target.startsWith(TREE_PREFIX) ? target.slice(TREE_PREFIX.length) : target;
 		if (!path.isAbsolute(file)) {
 			if (file.includes("://")) continue; // an internal or web URL, not a file here
@@ -110,6 +119,34 @@ export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unk
 		}
 	}
 	return undefined;
+}
+
+/** How deep a `read` path list may nest (a list whose members are lists) before the call is refused. */
+const MAX_LIST_DEPTH = 4;
+
+class UnresolvedList extends Error {
+	constructor(readonly entry: string) {
+		super(`path list nests deeper than ${MAX_LIST_DEPTH}`);
+	}
+}
+
+/**
+ * Every path a call can reach. The tool's approval targets name what one call
+ * reads, but `read` also accepts a path list (`a;b`, `a,b`, a quoted list): a
+ * path that is not itself a file is split with omp's own splitter and each
+ * member read on its own, while its approval target stays the whole string.
+ * So for `read`, every member's targets count too.
+ */
+async function executionTargets(tool: NativeFileTool, toolName: string, args: unknown, root: string, depth: number): Promise<string[]> {
+	const targets = [...(tool.approvalCacheTargets(args) ?? [])];
+	if (toolName !== "read") return targets;
+	const raw = args !== null && typeof args === "object" && "path" in args ? String((args as { path?: unknown }).path ?? "") : "";
+	if (raw === "") return targets;
+	const parts = await splitDelimitedPathEntry(raw, root);
+	if (parts === null) return targets;
+	if (depth >= MAX_LIST_DEPTH) throw new UnresolvedList(raw);
+	for (const part of parts) targets.push(...(await executionTargets(tool, toolName, { ...(args as object), path: part }, root, depth + 1)));
+	return targets;
 }
 
 function isInside(root: string, file: string): boolean {

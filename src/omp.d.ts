@@ -215,6 +215,10 @@ declare module "@oh-my-pi/pi-coding-agent/tools/ast-grep" {
 	import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
 	export const AstGrepTool: new (session: FileToolSession) => NativeFileTool;
 }
+// How omp's read splits a path list (`a;b`, `a,b`, quoted), at execution.
+declare module "@oh-my-pi/pi-coding-agent/tools/path-utils" {
+	export function splitDelimitedPathEntry(entry: string, cwd: string): Promise<string[] | null>;
+}
 
 declare module "@oh-my-pi/pi-coding-agent/tools/index" {
 	import type { FileToolSession } from "@oh-my-pi/pi-coding-agent";

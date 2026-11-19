@@ -386,6 +386,33 @@ export default function (pi) {
 		expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("host-only");
 	}, 120_000);
 
+	test("a read path list is checked member by member: a host file in a ;, comma or quoted list is refused", async () => {
+		const call = (name: string, args: Record<string, unknown>) => ({ name, arguments: args });
+		const outside = await fs.mkdtemp(path.join(scratch, "outside-"));
+		const secret = path.join(outside, "secret.txt");
+		await fs.writeFile(secret, "HOST-ONLY-SECRET");
+		const run = await runOmp(
+			[
+				call("read", { path: `nope.txt;${secret}` }),
+				call("read", { path: `nope.txt,${secret}` }),
+				call("read", { path: `"nope.txt;${secret}"` }),
+				call("read", { path: `a.txt;sub/b.txt` }),
+			],
+			{},
+			{ "a.txt": "inside A\n", "sub/b.txt": "inside B\n" },
+		);
+		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
+		for (const id of ["call_0", "call_1", "call_2"]) {
+			expect(byId.get(id)?.isError).toBe(true);
+			expect(byId.get(id)?.text).toContain("outside the sandboxed workspace");
+			expect(byId.get(id)?.text).not.toContain("HOST-ONLY-SECRET");
+		}
+		// A list of files inside the copy still reads both.
+		expect(byId.get("call_3")?.isError).toBe(false);
+		expect(byId.get("call_3")?.text).toContain("inside A");
+		expect(byId.get("call_3")?.text).toContain("inside B");
+	}, 120_000);
+
 	test("an interactive approval prompt shows the command the agent wrote, as for native bash, and its answer is followed", async () => {
 		// RPC mode with always-ask: each bash call raises omp's approval prompt.
 		const agentDir = path.join(scratch, "agent-always-ask");
