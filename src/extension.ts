@@ -26,7 +26,10 @@
  * machine, and ast_edit, whose paths omp does not report.
  *
  * Configuration (environment of the omp process):
- *   OMP_SANDBOX_BACKEND           "local" (tests); unset = extension inactive
+ *   OMP_SANDBOX_BACKEND           "gitmoot", or "local" (tests); unset = extension inactive
+ *   OMP_SANDBOX_GITMOOT_WORKSPACE gitmoot backend: the workspace id (`gitmoot workspace open`)
+ *   OMP_SANDBOX_GITMOOT_BIN       gitmoot backend: the gitmoot binary (default: `gitmoot` on PATH)
+ *   OMP_SANDBOX_GITMOOT_HOME      gitmoot backend: a gitmoot home (`--home`; default: the CLI's)
  *   OMP_SANDBOX_LOCAL_ROOT        local backend: the directory that is the sandbox
  *   OMP_SANDBOX_LOCAL_CONTAINMENT local backend: "full" or "process-tree" (default: best available)
  * omp's cwd is the host copy and must be an empty directory when omp starts.
@@ -55,6 +58,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent";
 import type { Backend } from "./backend.ts";
 import { type FileToolName, isFileTool, type LoadedFileTool, loadFileTools, refuseFileCall, refusedToolReason } from "./file-tools.ts";
+import { GitmootBackend } from "./gitmoot-backend.ts";
 import { LocalBackend } from "./local-backend.ts";
 import { Mirror } from "./mirror.ts";
 import { PathMap } from "./path-map.ts";
@@ -303,6 +307,13 @@ async function createSandbox(kind: string): Promise<Sandbox> {
 			throw new Error(`OMP_SANDBOX_LOCAL_CONTAINMENT must be "full" or "process-tree", not ${containment}`);
 		}
 		backend = await LocalBackend.create(root, containment ? { containment } : {});
+	} else if (kind === "gitmoot") {
+		const workspace = process.env.OMP_SANDBOX_GITMOOT_WORKSPACE;
+		if (workspace === undefined || workspace === "") throw new Error("OMP_SANDBOX_GITMOOT_WORKSPACE is not set");
+		const bin = process.env.OMP_SANDBOX_GITMOOT_BIN || Bun.which("gitmoot");
+		if (bin === null) throw new Error("OMP_SANDBOX_GITMOOT_BIN is not set and gitmoot is not on PATH");
+		const home = process.env.OMP_SANDBOX_GITMOOT_HOME;
+		backend = await GitmootBackend.open({ workspace, bin, ...(home ? { home } : {}) });
 	} else {
 		throw new Error(`unknown OMP_SANDBOX_BACKEND ${kind}`);
 	}

@@ -7,6 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { BackendError } from "../src/backend.ts";
 import { GitmootBackend, GitmootCliError } from "../src/gitmoot-backend.ts";
+import { Mirror } from "../src/mirror.ts";
 
 const FAKE = path.join(import.meta.dir, "fixtures/fake-gitmoot.sh");
 let root: string;
@@ -203,4 +204,156 @@ describe("GitmootBackend", () => {
 		const error = await backend.exec("true", { cwd: path.join(root, "sub dir") }).catch((e: unknown) => e);
 		expect(error).toBeInstanceOf(GitmootCliError);
 	});
+});
+
+describe("GitmootBackend files and sync", () => {
+	const bytes = (text: string) => new TextEncoder().encode(text);
+	const text = (data: Uint8Array) => new TextDecoder().decode(data);
+	const code = async (promise: Promise<unknown>) => ((await promise.catch((e: unknown) => e)) as BackendError).code;
+
+	test("readFile, writeFile and stat: contents, kept and given modes, and the documented refusals", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		await backend.writeFile(path.join(root, "new/deep/a.txt"), "one");
+		expect(text(await backend.readFile(path.join(root, "new/deep/a.txt")))).toBe("one");
+		expect((await fs.stat(path.join(root, "new/deep/a.txt"))).mode & 0o777).toBe(0o644);
+		await fs.chmod(path.join(root, "new/deep/a.txt"), 0o700);
+		await backend.writeFile(path.join(root, "new/deep/a.txt"), bytes("two"));
+		expect((await fs.stat(path.join(root, "new/deep/a.txt"))).mode & 0o777).toBe(0o700);
+		await backend.writeFile(path.join(root, "new/deep/a.txt"), "three", { mode: 0o755 });
+		expect((await fs.stat(path.join(root, "new/deep/a.txt"))).mode & 0o777).toBe(0o755);
+		expect(await backend.stat(path.join(root, "new/deep/a.txt"))).toMatchObject({ path: path.join(root, "new/deep/a.txt"), type: "file", size: 5 });
+		const statted = await backend.stat(path.join(root, "new/deep/a.txt"));
+		expect(Math.abs((statted?.mtimeMs ?? 0) - (await fs.stat(path.join(root, "new/deep/a.txt"))).mtimeMs)).toBeLessThan(2);
+		expect(await backend.stat(path.join(root, "missing"))).toBeNull();
+		await fs.symlink("/etc/passwd", path.join(root, "link"));
+		expect((await backend.stat(path.join(root, "link")))?.type).toBe("symlink");
+		expect(await code(backend.readFile(path.join(root, "missing")))).toBe("ENOENT");
+		expect(await code(backend.readFile(path.join(root, "new")))).toBe("EISDIR");
+		expect(await code(backend.writeFile(path.join(root, "new"), "x"))).toBe("EISDIR");
+		expect(await code(backend.readFile(path.join(root, "link")))).toBe("SYMLINK");
+		expect(await code(backend.writeFile(path.join(root, "link"), "x"))).toBe("SYMLINK");
+		expect(await fs.readFile("/etc/passwd", "utf8")).not.toBe("x");
+		expect(await code(backend.readFile("/etc/passwd"))).toBe("OUTSIDE_ROOT");
+		expect(await code(backend.readFile(path.join(root, "../x")))).toBe("OUTSIDE_ROOT");
+	}, 60_000);
+
+	test("list: sorted by path in byte order, recursive or not, limited, never entering a symlinked directory", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		await fs.writeFile(path.join(root, "B"), "bb");
+		await fs.writeFile(path.join(root, "sub dir/a b.txt"), "x");
+		await fs.symlink("/etc", path.join(root, "etc-link"));
+		const rel = (entries: { path: string; type: string }[]) => entries.map(e => `${path.relative(root, e.path)}:${e.type}`);
+		expect(rel((await backend.list(root)).entries)).toEqual(["B:file", "etc-link:symlink", "sub dir:dir"]);
+		expect(rel((await backend.list(root, { recursive: true })).entries)).toEqual(["B:file", "etc-link:symlink", "sub dir:dir", "sub dir/a b.txt:file"]);
+		expect((await backend.list(root, { recursive: true })).entries[0]?.size).toBe(2);
+		const cut = await backend.list(root, { recursive: true, limit: 2 });
+		expect(cut.truncated).toBe(true);
+		expect(rel(cut.entries)).toEqual(["B:file", "etc-link:symlink"]);
+		expect(await code(backend.list(path.join(root, "etc-link")))).toBe("SYMLINK");
+		expect(await code(backend.list(path.join(root, "B")))).toBe("ENOTDIR");
+		expect(await code(backend.list(path.join(root, "gone")))).toBe("ENOENT");
+	}, 60_000);
+
+	test("names that look like flags are paths, and list keeps an entry dated before 1970", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		for (const name of ["--json", "--home", "-plain"]) {
+			await backend.writeFile(path.join(root, name), name);
+			expect(text(await backend.readFile(path.join(root, name)))).toBe(name);
+			expect((await backend.stat(path.join(root, name)))?.type).toBe("file");
+		}
+		await fs.writeFile(path.join(root, "old"), "o");
+		// Fractional: find prints -86400.25 s as "-86401.7500000000".
+		await fs.utimes(path.join(root, "old"), new Date(-86_400_250), new Date(-86_400_250));
+		const entry = (await backend.list(root)).entries.find(e => e.path === path.join(root, "old"));
+		expect(entry?.mtimeMs).toBe(-86_400_250);
+	}, 60_000);
+
+	test("changes maps gitmoot's reset to full, seconds to ms, and keeps only permission bits", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		await fs.writeFile(path.join(root, "run.sh"), "#!/bin/sh\n");
+		await fs.chmod(path.join(root, "run.sh"), 0o755);
+		const changes = await backend.changes("ws1.anything");
+		expect(changes.full).toBe(true);
+		expect(changes.token.startsWith("ws1.")).toBe(true);
+		const entry = changes.changed.find(e => e.path === "run.sh");
+		expect(entry).toMatchObject({ type: "file", size: 10, mode: 0o755 });
+		expect(Math.abs((entry?.mtimeMs ?? 0) - (await fs.stat(path.join(root, "run.sh"))).mtimeMs)).toBeLessThan(2);
+	}, 60_000);
+
+	test("pull returns regular files with their modes and leaves out what is missing, a directory or a symlink", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		await fs.writeFile(path.join(root, "sub dir/x.sh"), "echo\n", { mode: 0o750 });
+		await fs.chmod(path.join(root, "sub dir/x.sh"), 0o750);
+		await fs.symlink("sub dir/x.sh", path.join(root, "link"));
+		const name = `${"long/".repeat(25)}file.txt`;
+		await fs.mkdir(path.dirname(path.join(root, name)), { recursive: true });
+		await fs.writeFile(path.join(root, name), "deep");
+		const files = await backend.pull(["sub dir/x.sh", "link", "sub dir", "missing", name]);
+		expect(files.map(f => [f.path, f.mode, text(f.data)])).toEqual([
+			["sub dir/x.sh", 0o750, "echo\n"],
+			[name, 0o644, "deep"],
+		]);
+		expect(await code(backend.pull(["../etc/passwd"]))).toBe("INVALID_PATH");
+	}, 60_000);
+
+	test("push writes files with their modes, creating parents; it refuses a symlink or directory there and applies nothing", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		await backend.push([
+			{ path: "a/b/c.txt", mode: 0o600, data: bytes("c") },
+			{ path: "top.sh", mode: 0o755, data: bytes("t") },
+		]);
+		expect(await fs.readFile(path.join(root, "a/b/c.txt"), "utf8")).toBe("c");
+		expect((await fs.stat(path.join(root, "a/b/c.txt"))).mode & 0o777).toBe(0o600);
+		expect((await fs.stat(path.join(root, "top.sh"))).mode & 0o777).toBe(0o755);
+		await fs.symlink("/etc/passwd", path.join(root, "link"));
+		const first = { path: "first.txt", mode: 0o644, data: bytes("1") };
+		expect(await code(backend.push([first, { path: "link", mode: 0o644, data: bytes("x") }]))).toBe("SYMLINK");
+		expect(await code(backend.push([first, { path: "sub dir", mode: 0o644, data: bytes("x") }]))).toBe("EISDIR");
+		expect(await Bun.file(path.join(root, "first.txt")).exists()).toBe(false);
+	}, 60_000);
+
+	test("remove unlinks files and symlinks without following them, keeps a non-empty directory, and still removes the rest", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		const outside = path.join(root, "..", `${path.basename(root)}-outside`);
+		await fs.writeFile(outside, "keep");
+		try {
+			await fs.symlink(outside, path.join(root, "link"));
+			await fs.writeFile(path.join(root, "sub dir/kept.txt"), "k");
+			await fs.mkdir(path.join(root, "empty"));
+			await fs.writeFile(path.join(root, "z.txt"), "z");
+			// Deepest first, as the Mirror sends them: the non-empty directory comes before later paths.
+			await backend.remove(["link", "sub dir", "missing/deeper", "empty", "z.txt"]);
+			expect(await fs.readFile(outside, "utf8")).toBe("keep");
+			expect((await fs.readdir(root)).sort()).toEqual(["sub dir"]);
+			expect(await fs.readdir(path.join(root, "sub dir"))).toEqual(["kept.txt"]);
+		} finally {
+			await fs.rm(outside, { force: true });
+		}
+	}, 60_000);
+
+	test("a Mirror over GitmootBackend: the sandbox fills the host copy, and host edits, modes and deletes go back", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		const host = await fs.mkdtemp(path.join(os.tmpdir(), "omp-sandbox-gitmoot-host-"));
+		try {
+			await fs.writeFile(path.join(root, "sub dir/a.txt"), "a");
+			await fs.writeFile(path.join(root, "keep.txt"), "k");
+			const mirror = await Mirror.create(backend, host);
+			await mirror.pullRemote();
+			expect(await fs.readFile(path.join(host, "sub dir/a.txt"), "utf8")).toBe("a");
+			await fs.writeFile(path.join(host, "keep.txt"), "k2");
+			await fs.chmod(path.join(host, "keep.txt"), 0o700);
+			await fs.mkdir(path.join(host, "new"));
+			await fs.writeFile(path.join(host, "new/n.txt"), "n");
+			await fs.rm(path.join(host, "sub dir"), { recursive: true });
+			await mirror.pushLocal();
+			expect((await fs.readdir(root)).sort()).toEqual(["keep.txt", "new"]);
+			expect(await fs.readFile(path.join(root, "keep.txt"), "utf8")).toBe("k2");
+			expect((await fs.stat(path.join(root, "keep.txt"))).mode & 0o777).toBe(0o700);
+			await fs.writeFile(path.join(root, "new/n.txt"), "from the sandbox");
+			await mirror.pullRemote();
+			expect(await fs.readFile(path.join(host, "new/n.txt"), "utf8")).toBe("from the sandbox");
+		} finally {
+			await fs.rm(host, { recursive: true, force: true });
+		}
+	}, 60_000);
 });

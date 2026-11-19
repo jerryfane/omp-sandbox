@@ -7,10 +7,13 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { GitmootBackend } from "../src/gitmoot-backend.ts";
+import { GitmootBackend, GitmootCliError } from "../src/gitmoot-backend.ts";
+import { Mirror } from "../src/mirror.ts";
 
 const BIN = process.env.GITMOOT_WS_BIN ?? "";
 const available = BIN !== "" && (await Bun.file(BIN).exists());
+const OMP = process.env.OMP_BIN ?? "/root/.local/bin/omp";
+const ompInstalled = await Bun.file(OMP).exists();
 
 let scratch: string;
 let home: string;
@@ -144,4 +147,140 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		expect(() => process.kill(pid, 0)).not.toThrow();
 		process.kill(pid, "SIGKILL");
 	}, 60_000);
+
+	test("files: write, read, stat and list through the real CLI, with its refusals", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		const dir = path.join(backend.root, "files-test");
+		await backend.writeFile(path.join(dir, "deep/a.sh"), "#!/bin/sh\n", { mode: 0o750 });
+		expect(new TextDecoder().decode(await backend.readFile(path.join(dir, "deep/a.sh")))).toBe("#!/bin/sh\n");
+		expect((await fs.stat(path.join(dir, "deep/a.sh"))).mode & 0o777).toBe(0o750);
+		expect(await backend.stat(path.join(dir, "deep/a.sh"))).toMatchObject({ type: "file", size: 10 });
+		expect(await backend.stat(path.join(dir, "nope"))).toBeNull();
+		await fs.symlink("/etc/passwd", path.join(dir, "link"));
+		expect((await backend.stat(path.join(dir, "link")))?.type).toBe("symlink");
+		const code = async (promise: Promise<unknown>) => ((await promise.catch((e: unknown) => e)) as { code?: string }).code;
+		expect(await code(backend.readFile(path.join(dir, "nope")))).toBe("ENOENT");
+		expect(await code(backend.readFile(path.join(dir, "deep")))).toBe("EISDIR");
+		expect(await code(backend.readFile(path.join(dir, "link")))).toBe("SYMLINK");
+		expect(await code(backend.writeFile(path.join(dir, "link"), "x"))).toBe("SYMLINK");
+		const listed = await backend.list(dir, { recursive: true });
+		expect(listed.entries.map(e => `${path.relative(dir, e.path)}:${e.type}`)).toEqual(["deep:dir", "deep/a.sh:file", "link:symlink"]);
+	}, 60_000);
+
+	test("real CLI: names that look like flags are paths, and list keeps an entry dated before 1970", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		const dir = path.join(backend.root, "flags-test");
+		for (const name of ["--json", "--home", "-plain"]) {
+			await backend.writeFile(path.join(dir, name), name);
+			expect(new TextDecoder().decode(await backend.readFile(path.join(dir, name)))).toBe(name);
+			expect((await backend.stat(path.join(dir, name)))?.type).toBe("file");
+		}
+		await backend.writeFile(path.join(backend.root, "--root-level"), "r");
+		expect((await backend.stat(path.join(backend.root, "--root-level")))?.size).toBe(1);
+		// Fractional: find prints -86400.25 s as "-86401.7500000000".
+		await fs.utimes(path.join(dir, "-plain"), new Date(-86_400_250), new Date(-86_400_250));
+		const entry = (await backend.list(dir)).entries.find(e => e.path === path.join(dir, "-plain"));
+		expect(entry?.mtimeMs).toBe(-86_400_250);
+	}, 60_000);
+
+	test("sync: changes is incremental with exact deletes; pull, push and remove keep their contracts", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		const base = await backend.changes();
+		expect(base.full).toBe(true);
+		await fs.mkdir(path.join(backend.root, "sync-test/full"), { recursive: true });
+		await fs.writeFile(path.join(backend.root, "sync-test/full/kept.txt"), "k");
+		await backend.push([
+			{ path: "sync-test/a.txt", mode: 0o600, data: new TextEncoder().encode("a") },
+			{ path: "sync-test/new/b.txt", mode: 0o644, data: new TextEncoder().encode("b") },
+		]);
+		const pulled = await backend.pull(["sync-test/a.txt", "sync-test/new", "sync-test/missing"]);
+		expect(pulled.map(f => [f.path, f.mode, new TextDecoder().decode(f.data)])).toEqual([["sync-test/a.txt", 0o600, "a"]]);
+		const after = await backend.changes(base.token);
+		expect(after.full).toBe(false);
+		expect(after.changed.map(e => e.path)).toEqual(expect.arrayContaining(["sync-test/a.txt", "sync-test/new/b.txt", "sync-test/full/kept.txt"]));
+		const entry = after.changed.find(e => e.path === "sync-test/a.txt");
+		expect(entry?.mode).toBe(0o600);
+		expect(Math.abs((entry?.mtimeMs ?? 0) - (await fs.stat(path.join(backend.root, "sync-test/a.txt"))).mtimeMs)).toBeLessThan(2);
+		// The Mirror's order: deepest first. The non-empty directory stays, the rest goes.
+		await backend.remove(["sync-test/new/b.txt", "sync-test/new", "sync-test/full", "sync-test/a.txt", "sync-test/gone"]);
+		expect((await fs.readdir(path.join(backend.root, "sync-test"))).sort()).toEqual(["full"]);
+		const deleted = await backend.changes(after.token);
+		expect(deleted.deleted.sort()).toEqual(["sync-test/a.txt", "sync-test/new", "sync-test/new/b.txt"]);
+		const refused = await backend.remove([".git/HEAD"]).catch((e: unknown) => e);
+		expect(refused).toBeInstanceOf(GitmootCliError);
+	}, 60_000);
+
+	test("a Mirror over the real CLI: fills the host copy, sends host edits and deletes, brings sandbox edits back", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		const host = await fs.mkdtemp(path.join(scratch, "mirror-"));
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		expect(await fs.readFile(path.join(host, "README.md"), "utf8")).toBe("widget\n");
+		await fs.writeFile(path.join(host, "README.md"), "widget, edited on the host\n");
+		await fs.mkdir(path.join(host, "mirror-new"));
+		await fs.writeFile(path.join(host, "mirror-new/n.txt"), "n");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(backend.root, "README.md"), "utf8")).toBe("widget, edited on the host\n");
+		expect(await fs.readFile(path.join(backend.root, "mirror-new/n.txt"), "utf8")).toBe("n");
+		await fs.rm(path.join(host, "mirror-new"), { recursive: true });
+		await mirror.pushLocal();
+		expect(await Bun.file(path.join(backend.root, "mirror-new")).exists()).toBe(false);
+		await fs.writeFile(path.join(backend.root, "README.md"), "widget, edited in the sandbox\n");
+		await mirror.pullRemote();
+		expect(await fs.readFile(path.join(host, "README.md"), "utf8")).toBe("widget, edited in the sandbox\n");
+	}, 120_000);
+
+	test.if(ompInstalled)("installed omp with OMP_SANDBOX_BACKEND=gitmoot: bash and the file tools act on the workspace, never the host", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		const agentDir = path.join(scratch, "omp-agent");
+		const hostDir = path.join(scratch, "omp-host");
+		await fs.mkdir(agentDir, { recursive: true });
+		// Replace-mode edit (old_string/new_string) for the scripted model, as in omp-integration.test.ts.
+		await fs.writeFile(path.join(agentDir, "config.yml"), "edit:\n  modelVariants:\n    scripted: replace\n");
+		await fs.mkdir(hostDir);
+		const script = [
+			{ name: "bash", arguments: { command: 'pwd; echo "secret=[${OMP_SANDBOX_TEST_HOST_SECRET-}]"; echo from-bash > omp-bash.txt' } },
+			{ name: "read", arguments: { path: "README.md" } },
+			{ name: "write", arguments: { path: "omp-dir/written.txt", content: "written by omp\n" } },
+			{ name: "edit", arguments: { path: "omp-bash.txt", old_string: "from-bash", new_string: "edited" } },
+			{ name: "bash", arguments: { command: "cat omp-dir/written.txt omp-bash.txt" } },
+		];
+		const child = Bun.spawn(
+			[OMP, "--trusted-extension", path.join(import.meta.dir, "fixtures/scripted-provider.ts"), "--trusted-extension", path.resolve(import.meta.dir, "../src/extension.ts"), "--model", "scripted/scripted-1", "--no-session", "--mode", "json", "-p", "go"],
+			{
+				cwd: hostDir,
+				env: {
+					HOME: path.join(scratch, "omp-home"),
+					PATH: "/usr/local/bin:/usr/bin:/bin",
+					TERM: "dumb",
+					GITMOOT_ORG_ROLE: "intern",
+					PI_CODING_AGENT_DIR: agentDir,
+					PI_CONFIG_DIR: path.join(scratch, "omp-config"),
+					OMP_SANDBOX_SCRIPT: JSON.stringify(script),
+					OMP_SANDBOX_BACKEND: "gitmoot",
+					OMP_SANDBOX_GITMOOT_BIN: BIN,
+					OMP_SANDBOX_GITMOOT_HOME: home,
+					OMP_SANDBOX_GITMOOT_WORKSPACE: workspace,
+					OMP_SANDBOX_TEST_HOST_SECRET: "must-not-leak",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const [stdout, , exitCode] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+		expect(exitCode).toBe(0);
+		const ends = stdout
+			.split("\n")
+			.filter(line => line.includes('"tool_execution_end"'))
+			.map(line => JSON.parse(line) as { isError?: boolean; result?: { isError?: boolean; content?: { text?: string }[] } })
+			.map(end => ({ isError: end.isError === true || end.result?.isError === true, text: (end.result?.content ?? []).map(c => c.text ?? "").join("") }));
+		expect(ends.map(end => (end.isError ? end.text : false))).toEqual([false, false, false, false, false]);
+		expect(ends[0]?.text).toContain(`${backend.root}\nsecret=[]`);
+		expect(ends[1]?.text).toContain("widget");
+		expect(ends[4]?.text).toContain("written by omp\nedited");
+		expect(await fs.readFile(path.join(backend.root, "omp-dir/written.txt"), "utf8")).toBe("written by omp\n");
+		expect(await fs.readFile(path.join(backend.root, "omp-bash.txt"), "utf8")).toBe("edited\n");
+		// The host directory is the mirror: it follows the workspace.
+		expect(await fs.readFile(path.join(hostDir, "omp-bash.txt"), "utf8")).toBe("edited\n");
+	}, 180_000);
 });

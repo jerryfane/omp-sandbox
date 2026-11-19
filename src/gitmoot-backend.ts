@@ -28,7 +28,21 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import { constants as osConstants } from "node:os";
 import * as path from "node:path";
-import { BackendError, DEFAULT_MAX_OUTPUT_BYTES, type ExecOptions, type ExecResult, type OutputStream } from "./backend.ts";
+import {
+	type Backend,
+	BackendError,
+	type Changes,
+	DEFAULT_MAX_OUTPUT_BYTES,
+	type ExecOptions,
+	type ExecResult,
+	type FileStat,
+	type FileType,
+	type ListOptions,
+	type ListResult,
+	type OutputStream,
+	type SyncFile,
+} from "./backend.ts";
+import { readTar, writeTar } from "./tar.ts";
 import { ENV_NAME, shellQuote } from "./shell.ts";
 
 const SIGNAL_NAMES: ReadonlyMap<number, string> = new Map(Object.entries(osConstants.signals).map(([name, number]) => [number, name]));
@@ -72,7 +86,14 @@ export interface GitmootBackendOptions {
 	home?: string;
 }
 
-export class GitmootBackend {
+/** A workspace-relative path for pull, push and remove: not empty, no ".", ".." or empty components, no NUL. */
+function checkRelative(rel: string): void {
+	if (rel === "" || rel.includes("\0") || rel.split("/").some(part => part === "" || part === "." || part === "..")) {
+		throw new BackendError("INVALID_PATH", rel, `workspace paths must be relative, without empty, . or .. components: ${rel}`);
+	}
+}
+
+export class GitmootBackend implements Backend {
 	readonly name = "gitmoot";
 	readonly root: string;
 	/** gitmoot's supervisor and watchdog kill the command's process group (within 15 s if the CLI dies), nothing outside it. */
@@ -212,8 +233,155 @@ export class GitmootBackend {
 		}
 	}
 
+	/** Read a whole regular file (`workspace read`). */
+	async readFile(file: string): Promise<Uint8Array> {
+		const rel = this.#rel(file);
+		const result = await callCli(this.bin, ["workspace", "read", this.workspace, ...homeArgs(this.home), "--", rel], "workspace read");
+		if (result.code === 0) return result.stdout;
+		throw this.#fileError(result, file, "workspace read");
+	}
+
+	/** Write a whole regular file atomically (`workspace write`); an existing file keeps its mode unless `mode` is given. */
+	async writeFile(file: string, data: Uint8Array | string, options?: { mode?: number }): Promise<void> {
+		const rel = this.#rel(file);
+		if (rel === "") throw new BackendError("EISDIR", file, `is a directory: ${file}`);
+		const modeArgs = options?.mode === undefined ? [] : ["--mode", (options.mode & 0o7777).toString(8)];
+		const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+		const result = await callCli(this.bin, ["workspace", "write", this.workspace, ...homeArgs(this.home), ...modeArgs, "--", rel], "workspace write", bytes);
+		if (result.code !== 0) throw this.#fileError(result, file, "workspace write");
+	}
+
+	/** Stat without following a final symlink (`workspace stat`); null when missing. */
+	async stat(file: string): Promise<FileStat | null> {
+		const rel = this.#rel(file);
+		const result = await callCli(this.bin, ["workspace", "stat", this.workspace, ...homeArgs(this.home), "--json", "--", rel], "workspace stat");
+		if (result.code === 3) return null;
+		if (result.code !== 0) throw this.#fileError(result, file, "workspace stat");
+		const value = JSON.parse(new TextDecoder().decode(result.stdout)) as { type: FileType; size: number; mtime: number };
+		return { path: path.posix.normalize(file), type: value.type, size: value.size, mtimeMs: value.mtime * 1000 };
+	}
+
+	/**
+	 * List a directory with `find` in the workspace (gitmoot has no listing
+	 * command): `--cwd` confines the directory, and find never follows a
+	 * symlink. The whole requested tree is read, then sorted by path in byte
+	 * order, so `limit` bounds the result, not the work.
+	 */
+	async list(dir: string, options: ListOptions = {}): Promise<ListResult> {
+		const info = await this.stat(dir);
+		if (info === null) throw new BackendError("ENOENT", dir, `no such directory: ${dir}`);
+		if (info.type === "symlink") throw new BackendError("SYMLINK", dir, `is a symlink: ${dir}`);
+		if (info.type !== "dir") throw new BackendError("ENOTDIR", dir, `not a directory: ${dir}`);
+		const depth = options.recursive ? "" : " -maxdepth 1";
+		const result = await this.exec(`find . -mindepth 1${depth} -printf '%y %s %T@ %P\\0'`, { cwd: dir });
+		if (result.exitCode !== 0 || result.truncated) {
+			throw new Error(`listing ${dir} in the workspace failed (${result.truncated ? "output too large" : (result.exitCode ?? result.signal)}): ${result.stderr.trim().slice(0, 300)}`);
+		}
+		const base = path.posix.normalize(dir);
+		const entries: FileStat[] = [];
+		for (const record of result.stdout.split("\0")) {
+			if (record === "") continue;
+			// find's %T@ is the signed whole seconds (tv_sec) then the nanoseconds as an
+			// unsigned fraction: -0.5 s prints as "-1.5000000000", so the two parts add.
+			const match = /^(\S) (\d+) (-?\d+)(?:\.(\d+))? (.+)$/s.exec(record);
+			if (match === null) throw new Error(`listing ${dir}: unexpected find output ${JSON.stringify(record.slice(0, 100))}`);
+			const [, kind, size, seconds, fraction, rel] = match as unknown as [string, string, string, string, string | undefined, string];
+			const type: FileType = kind === "f" ? "file" : kind === "d" ? "dir" : kind === "l" ? "symlink" : "other";
+			const mtimeMs = Number(seconds) * 1000 + (fraction === undefined ? 0 : Number(`0.${fraction}`) * 1000);
+			entries.push({ path: path.posix.join(base, rel), type, size: Number(size), mtimeMs });
+		}
+		entries.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
+		const limit = options.limit ?? Number.POSITIVE_INFINITY;
+		return entries.length > limit ? { entries: entries.slice(0, limit), truncated: true } : { entries, truncated: false };
+	}
+
+	/** `workspace changes --since`; `reset` maps to `full`. Over-reports, never under-reports (gitmoot's racy-clean rule). */
+	async changes(since?: string): Promise<Changes> {
+		const out = await runCli(this.bin, ["workspace", "changes", this.workspace, ...homeArgs(this.home), "--since", since ?? "start", "--json"], "workspace changes");
+		const value = JSON.parse(out) as { reset: boolean; token: string; changed: { path: string; type: FileType; size: number; mtime: number; mode: number }[]; deleted: string[] };
+		return {
+			token: value.token,
+			full: value.reset || since === undefined,
+			changed: value.changed.map(entry => ({ path: entry.path, type: entry.type, size: entry.size, mtimeMs: entry.mtime * 1000, mode: entry.mode & 0o7777 })),
+			deleted: value.deleted,
+		};
+	}
+
+	/** The regular files at `paths` (`workspace pull`, a tar stream); missing, special or symlinked paths are left out. */
+	async pull(paths: readonly string[]): Promise<SyncFile[]> {
+		if (paths.length === 0) return [];
+		for (const rel of paths) checkRelative(rel);
+		const result = await callCli(this.bin, ["workspace", "pull", this.workspace, ...homeArgs(this.home), "--", ...paths], "workspace pull");
+		if (result.code !== 0) throw this.#fileError(result, paths.join(", "), "workspace pull");
+		const wanted = new Set(paths);
+		return readTar(result.stdout).flatMap(entry => (entry.type === "file" && wanted.has(entry.path) ? [{ path: entry.path, mode: entry.mode, data: entry.data }] : []));
+	}
+
+	/**
+	 * Write each file (`workspace push --files`, a tar stream): atomic per
+	 * file, with its mode, parents created. gitmoot refuses to replace a
+	 * symlink (SYMLINK here) or a directory (EISDIR), checking the whole stream
+	 * before applying anything.
+	 */
+	async push(files: readonly SyncFile[]): Promise<void> {
+		if (files.length === 0) return;
+		for (const file of files) checkRelative(file.path);
+		const stream = writeTar(files.map(file => ({ type: "file" as const, path: file.path, mode: file.mode, data: file.data })));
+		const result = await callCli(this.bin, ["workspace", "push", this.workspace, ...homeArgs(this.home), "--files", "--json"], "workspace push --files", stream);
+		if (result.code === 0) return;
+		const error = cliError("workspace push --files", result.stderr);
+		if (error instanceof GitmootCliError && error.code === "cwd_outside_root" && /symlink/.test(error.message)) throw new BackendError("SYMLINK", files[0]?.path ?? "", error.message);
+		if (error instanceof GitmootCliError && error.code === "is_directory") throw new BackendError("EISDIR", files[0]?.path ?? "", error.message);
+		throw error;
+	}
+
+	/**
+	 * Remove each path (`workspace remove`): unlink a file or symlink (never
+	 * followed), remove a directory only when empty, ignore a path already
+	 * gone. gitmoot fails a non-empty directory with `not_empty`, but here it
+	 * stays (the sandbox has new content there): the batch is then retried one
+	 * path at a time, which is safe because removing is idempotent.
+	 */
+	async remove(paths: readonly string[]): Promise<void> {
+		if (paths.length === 0) return;
+		for (const rel of paths) checkRelative(rel);
+		try {
+			await this.#removeBatch(paths);
+		} catch (error) {
+			if (!(error instanceof GitmootCliError && error.code === "not_empty")) throw error;
+			for (const rel of paths) {
+				await this.#removeBatch([rel]).catch((single: unknown) => {
+					if (!(single instanceof GitmootCliError && single.code === "not_empty")) throw single;
+				});
+			}
+		}
+	}
+
+	async #removeBatch(paths: readonly string[]): Promise<void> {
+		await runCli(this.bin, ["workspace", "remove", this.workspace, ...homeArgs(this.home), "--json", "--", ...paths], "workspace remove");
+	}
+
 	/** Nothing to release: each CLI call is its own connection. The workspace stays. */
 	async close(): Promise<void> {}
+
+	/** A sandbox path as gitmoot's `<rel>`: relative to root, "" for the root itself; refuses anything outside. */
+	#rel(file: string): string {
+		if (!path.posix.isAbsolute(file) || file.includes("\0")) throw new BackendError("INVALID_PATH", file, `sandbox paths must be absolute: ${file}`);
+		const relative = path.posix.relative(this.root, path.posix.normalize(file));
+		if (relative === ".." || relative.startsWith("../") || path.posix.isAbsolute(relative)) {
+			throw new BackendError("OUTSIDE_ROOT", file, `path is outside the sandbox root: ${file}`);
+		}
+		return relative;
+	}
+
+	/** gitmoot's file-command exits as BackendErrors: 3 not found, 4 a directory, cwd_outside_root a symlink or escape. */
+	#fileError(result: { code: number | null; stderr: string }, file: string, label: string): Error {
+		if (result.code === 3) return new BackendError("ENOENT", file, `no such file: ${file}`);
+		if (result.code === 4) return new BackendError("EISDIR", file, `is a directory: ${file}`);
+		const error = cliError(label, result.stderr);
+		if (error instanceof GitmootCliError && error.code === "cwd_outside_root") return new BackendError("SYMLINK", file, error.message);
+		return error;
+	}
 
 	/**
 	 * `cwd` relative to the root, as `./<path>/.` ("." for the root), so the
@@ -221,13 +389,8 @@ export class GitmootBackend {
 	 * ends with a space. Refuses a path outside the root.
 	 */
 	#relative(cwd: string): string {
-		if (!path.posix.isAbsolute(cwd) || cwd.includes("\0")) throw new BackendError("INVALID_PATH", cwd, `sandbox paths must be absolute: ${cwd}`);
-		const relative = path.posix.relative(this.root, path.posix.normalize(cwd));
-		if (relative === "") return ".";
-		if (relative === ".." || relative.startsWith("../") || path.posix.isAbsolute(relative)) {
-			throw new BackendError("OUTSIDE_ROOT", cwd, `path is outside the sandbox root: ${cwd}`);
-		}
-		return `./${relative}/.`;
+		const relative = this.#rel(cwd);
+		return relative === "" ? "." : `./${relative}/.`;
 	}
 }
 
@@ -264,20 +427,27 @@ function parseWorkspace(stdout: string): WorkspaceInfo {
 }
 
 /** Run the CLI and return its stdout; its own failures become GitmootCliError. */
-function runCli(bin: string, args: string[], label: string): Promise<string> {
+async function runCli(bin: string, args: string[], label: string): Promise<string> {
+	const result = await callCli(bin, args, label);
+	if (result.code !== 0) throw result.code === CLI_FAILURE ? cliError(label, result.stderr) : new Error(`gitmoot ${label} exited ${result.code}: ${result.stderr.trim().slice(0, 300)}`);
+	return new TextDecoder().decode(result.stdout);
+}
+
+/** Run the CLI with optional stdin bytes; the raw exit code, stdout bytes and stderr text. */
+function callCli(bin: string, args: string[], label: string, stdin?: Uint8Array): Promise<{ code: number | null; stdout: Uint8Array; stderr: string }> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(bin, args, { stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
 		const out: Buffer[] = [];
 		const err: Buffer[] = [];
-		child.stdout.on("data", chunk => out.push(chunk));
-		child.stderr.on("data", chunk => err.push(chunk));
-		child.on("error", reject);
-		child.on("close", code => {
-			const stdout = Buffer.concat(out).toString("utf8");
-			const stderr = Buffer.concat(err).toString("utf8");
-			if (code === 0) return resolve(stdout);
-			reject(code === CLI_FAILURE ? cliError(label, stderr) : new Error(`gitmoot ${label} exited ${code}: ${stderr.trim().slice(0, 300)}`));
-		});
+		child.stdout?.on("data", chunk => out.push(chunk));
+		child.stderr?.on("data", chunk => err.push(chunk));
+		child.on("error", error => reject(new Error(`gitmoot ${label}: ${error.message}`)));
+		child.on("close", code => resolve({ code, stdout: Buffer.concat(out), stderr: Buffer.concat(err).toString("utf8") }));
+		if (stdin !== undefined) {
+			// EPIPE when the CLI refuses early: its exit code says why.
+			child.stdin?.on("error", () => {});
+			child.stdin?.end(stdin);
+		}
 	});
 }
 

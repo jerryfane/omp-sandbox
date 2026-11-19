@@ -74,6 +74,11 @@ case "${1-} ${2-}" in
 	# group (SIGKILL 3 s later), and writes the status file from the real wait status.
 	exec /usr/bin/python3 "$RUNNER" "${status_file:--}" /usr/bin/env -i HOME="$FAKE_GITMOOT_ROOT" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "${envs[@]}" "$@" </dev/null
 	;;
+"workspace read" | "workspace write" | "workspace stat" | "workspace changes" | "workspace pull" | "workspace push" | "workspace remove")
+	command=$2
+	shift 2
+	exec /usr/bin/python3 "$(dirname -- "$(readlink -f -- "$0")")/fake-gitmoot-files.py" "$FAKE_GITMOOT_ROOT" "$id" "$command" "$@"
+	;;
 *)
 	fail invalid_args "fake gitmoot does not implement: $*"
 	;;
