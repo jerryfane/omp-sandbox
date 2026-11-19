@@ -438,15 +438,15 @@ export default function (pi) {
 		expect(await fs.readFile(secret, "utf8")).toBe("HOST-ONLY-SECRET");
 	}, 180_000);
 
-	test("build output stays in the sandbox, and file tools on it are refused, also as a search root or list member", async () => {
+	test("build output stays in the sandbox, and file tools on it are refused, also as a search root or at depth", async () => {
 		const call = (name: string, args: Record<string, unknown>) => ({ name, arguments: args });
 		const run = await runOmp([
-			bash({ command: "mkdir -p node_modules/dep && echo needle > node_modules/dep/index.js && echo needle > app.ts" }),
+			bash({ command: "mkdir -p node_modules/dep pkg/target && echo needle > node_modules/dep/index.js && echo needle > pkg/target/out && echo needle > app.ts" }),
 			call("read", { path: "node_modules/dep/index.js" }),
 			call("write", { path: "node_modules/dep/planted.js", content: "x" }),
 			call("grep", { pattern: "needle", path: "node_modules" }),
 			call("glob", { path: "node_modules/**" }),
-			call("read", { path: "app.ts;node_modules/dep/index.js" }),
+			call("read", { path: "pkg/target/out" }),
 			call("grep", { pattern: "needle", path: "." }),
 		]);
 		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
