@@ -233,9 +233,10 @@ describe("GitmootBackend files and sync", () => {
 			expect((await backend.stat(path.join(root, name)))?.type).toBe("file");
 		}
 		await fs.writeFile(path.join(root, "old"), "o");
-		await fs.utimes(path.join(root, "old"), new Date(-86_400_000), new Date(-86_400_000));
+		// Fractional: find prints -86400.25 s as "-86401.7500000000".
+		await fs.utimes(path.join(root, "old"), new Date(-86_400_250), new Date(-86_400_250));
 		const entry = (await backend.list(root)).entries.find(e => e.path === path.join(root, "old"));
-		expect(entry?.mtimeMs).toBe(-86_400_000);
+		expect(entry?.mtimeMs).toBe(-86_400_250);
 	}, 60_000);
 
 	test("changes maps gitmoot's reset to full, seconds to ms, and keeps only permission bits", async () => {

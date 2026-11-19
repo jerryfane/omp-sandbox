@@ -177,9 +177,10 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		}
 		await backend.writeFile(path.join(backend.root, "--root-level"), "r");
 		expect((await backend.stat(path.join(backend.root, "--root-level")))?.size).toBe(1);
-		await fs.utimes(path.join(dir, "-plain"), new Date(-86_400_000), new Date(-86_400_000));
+		// Fractional: find prints -86400.25 s as "-86401.7500000000".
+		await fs.utimes(path.join(dir, "-plain"), new Date(-86_400_250), new Date(-86_400_250));
 		const entry = (await backend.list(dir)).entries.find(e => e.path === path.join(dir, "-plain"));
-		expect(entry?.mtimeMs).toBe(-86_400_000);
+		expect(entry?.mtimeMs).toBe(-86_400_250);
 	}, 60_000);
 
 	test("sync: changes is incremental with exact deletes; pull, push and remove keep their contracts", async () => {

@@ -281,11 +281,14 @@ export class GitmootBackend implements Backend {
 		const entries: FileStat[] = [];
 		for (const record of result.stdout.split("\0")) {
 			if (record === "") continue;
-			const match = /^(\S) (\d+) (-?[\d.]+) (.+)$/s.exec(record);
+			// find's %T@ is the signed whole seconds (tv_sec) then the nanoseconds as an
+			// unsigned fraction: -0.5 s prints as "-1.5000000000", so the two parts add.
+			const match = /^(\S) (\d+) (-?\d+)(?:\.(\d+))? (.+)$/s.exec(record);
 			if (match === null) throw new Error(`listing ${dir}: unexpected find output ${JSON.stringify(record.slice(0, 100))}`);
-			const [, kind, size, mtime, rel] = match as unknown as [string, string, string, string, string];
+			const [, kind, size, seconds, fraction, rel] = match as unknown as [string, string, string, string, string | undefined, string];
 			const type: FileType = kind === "f" ? "file" : kind === "d" ? "dir" : kind === "l" ? "symlink" : "other";
-			entries.push({ path: path.posix.join(base, rel), type, size: Number(size), mtimeMs: Number(mtime) * 1000 });
+			const mtimeMs = Number(seconds) * 1000 + (fraction === undefined ? 0 : Number(`0.${fraction}`) * 1000);
+			entries.push({ path: path.posix.join(base, rel), type, size: Number(size), mtimeMs });
 		}
 		entries.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
 		const limit = options.limit ?? Number.POSITIVE_INFINITY;
