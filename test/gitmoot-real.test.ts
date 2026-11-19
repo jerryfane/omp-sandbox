@@ -167,6 +167,21 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		expect(listed.entries.map(e => `${path.relative(dir, e.path)}:${e.type}`)).toEqual(["deep:dir", "deep/a.sh:file", "link:symlink"]);
 	}, 60_000);
 
+	test("real CLI: names that look like flags are paths, and list keeps an entry dated before 1970", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		const dir = path.join(backend.root, "flags-test");
+		for (const name of ["--json", "--home", "-plain"]) {
+			await backend.writeFile(path.join(dir, name), name);
+			expect(new TextDecoder().decode(await backend.readFile(path.join(dir, name)))).toBe(name);
+			expect((await backend.stat(path.join(dir, name)))?.type).toBe("file");
+		}
+		await backend.writeFile(path.join(backend.root, "--root-level"), "r");
+		expect((await backend.stat(path.join(backend.root, "--root-level")))?.size).toBe(1);
+		await fs.utimes(path.join(dir, "-plain"), new Date(-86_400_000), new Date(-86_400_000));
+		const entry = (await backend.list(dir)).entries.find(e => e.path === path.join(dir, "-plain"));
+		expect(entry?.mtimeMs).toBe(-86_400_000);
+	}, 60_000);
+
 	test("sync: changes is incremental with exact deletes; pull, push and remove keep their contracts", async () => {
 		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
 		const base = await backend.changes();

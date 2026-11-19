@@ -236,7 +236,7 @@ export class GitmootBackend implements Backend {
 	/** Read a whole regular file (`workspace read`). */
 	async readFile(file: string): Promise<Uint8Array> {
 		const rel = this.#rel(file);
-		const result = await callCli(this.bin, ["workspace", "read", this.workspace, ...homeArgs(this.home), rel], "workspace read");
+		const result = await callCli(this.bin, ["workspace", "read", this.workspace, ...homeArgs(this.home), "--", rel], "workspace read");
 		if (result.code === 0) return result.stdout;
 		throw this.#fileError(result, file, "workspace read");
 	}
@@ -247,14 +247,14 @@ export class GitmootBackend implements Backend {
 		if (rel === "") throw new BackendError("EISDIR", file, `is a directory: ${file}`);
 		const modeArgs = options?.mode === undefined ? [] : ["--mode", (options.mode & 0o7777).toString(8)];
 		const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
-		const result = await callCli(this.bin, ["workspace", "write", this.workspace, ...homeArgs(this.home), ...modeArgs, rel], "workspace write", bytes);
+		const result = await callCli(this.bin, ["workspace", "write", this.workspace, ...homeArgs(this.home), ...modeArgs, "--", rel], "workspace write", bytes);
 		if (result.code !== 0) throw this.#fileError(result, file, "workspace write");
 	}
 
 	/** Stat without following a final symlink (`workspace stat`); null when missing. */
 	async stat(file: string): Promise<FileStat | null> {
 		const rel = this.#rel(file);
-		const result = await callCli(this.bin, ["workspace", "stat", this.workspace, ...homeArgs(this.home), rel, "--json"], "workspace stat");
+		const result = await callCli(this.bin, ["workspace", "stat", this.workspace, ...homeArgs(this.home), "--json", "--", rel], "workspace stat");
 		if (result.code === 3) return null;
 		if (result.code !== 0) throw this.#fileError(result, file, "workspace stat");
 		const value = JSON.parse(new TextDecoder().decode(result.stdout)) as { type: FileType; size: number; mtime: number };
@@ -281,7 +281,7 @@ export class GitmootBackend implements Backend {
 		const entries: FileStat[] = [];
 		for (const record of result.stdout.split("\0")) {
 			if (record === "") continue;
-			const match = /^(\S) (\d+) ([\d.]+) (.+)$/s.exec(record);
+			const match = /^(\S) (\d+) (-?[\d.]+) (.+)$/s.exec(record);
 			if (match === null) throw new Error(`listing ${dir}: unexpected find output ${JSON.stringify(record.slice(0, 100))}`);
 			const [, kind, size, mtime, rel] = match as unknown as [string, string, string, string, string];
 			const type: FileType = kind === "f" ? "file" : kind === "d" ? "dir" : kind === "l" ? "symlink" : "other";
@@ -386,13 +386,8 @@ export class GitmootBackend implements Backend {
 	 * ends with a space. Refuses a path outside the root.
 	 */
 	#relative(cwd: string): string {
-		if (!path.posix.isAbsolute(cwd) || cwd.includes("\0")) throw new BackendError("INVALID_PATH", cwd, `sandbox paths must be absolute: ${cwd}`);
-		const relative = path.posix.relative(this.root, path.posix.normalize(cwd));
-		if (relative === "") return ".";
-		if (relative === ".." || relative.startsWith("../") || path.posix.isAbsolute(relative)) {
-			throw new BackendError("OUTSIDE_ROOT", cwd, `path is outside the sandbox root: ${cwd}`);
-		}
-		return `./${relative}/.`;
+		const relative = this.#rel(cwd);
+		return relative === "" ? "." : `./${relative}/.`;
 	}
 }
 

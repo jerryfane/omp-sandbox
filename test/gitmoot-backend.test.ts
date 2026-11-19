@@ -225,6 +225,19 @@ describe("GitmootBackend files and sync", () => {
 		expect(await code(backend.list(path.join(root, "gone")))).toBe("ENOENT");
 	}, 60_000);
 
+	test("names that look like flags are paths, and list keeps an entry dated before 1970", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		for (const name of ["--json", "--home", "-plain"]) {
+			await backend.writeFile(path.join(root, name), name);
+			expect(text(await backend.readFile(path.join(root, name)))).toBe(name);
+			expect((await backend.stat(path.join(root, name)))?.type).toBe("file");
+		}
+		await fs.writeFile(path.join(root, "old"), "o");
+		await fs.utimes(path.join(root, "old"), new Date(-86_400_000), new Date(-86_400_000));
+		const entry = (await backend.list(root)).entries.find(e => e.path === path.join(root, "old"));
+		expect(entry?.mtimeMs).toBe(-86_400_000);
+	}, 60_000);
+
 	test("changes maps gitmoot's reset to full, seconds to ms, and keeps only permission bits", async () => {
 		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
 		await fs.writeFile(path.join(root, "run.sh"), "#!/bin/sh\n");
