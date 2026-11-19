@@ -96,17 +96,31 @@ const TREE_PREFIX = "tree\0";
  * when every path it touches is inside it. Internal and web URLs are not
  * workspace paths and are left to the tool.
  *
- * Two checks. The tool's own approval targets, its reading of the arguments.
- * And a lexical one over the raw path arguments, because `read` takes a path
- * list that it splits only at execution (`;`, `,`, whitespace, after decoding
- * a file:// URL, around internal URLs), which its approval target does not
- * show. The lexical check splits more than any tool does and needs no
- * filesystem state, so it gives the same answer whenever it runs: a path that
- * holds a delimiter followed by an outside path is refused even when it names
- * a real file inside the copy.
+ * Three layers, outermost first:
+ * 1. One plain path per argument. omp's file tools read some path strings as
+ *    several paths (`read` splits a list at execution on `;`, `,` and
+ *    whitespace, around internal URLs, after decoding a file:// URL; globs
+ *    expand braces). Predicting every such reading failed three review rounds
+ *    in a row, so a path argument, or a path the tool itself reports, that
+ *    holds a list separator, a brace, a backslash, a percent-escape or a
+ *    file:// prefix is refused outright: one plain path per call.
+ *    Whitespace is allowed, since names with spaces are ordinary; layer 3
+ *    checks every whitespace-separated piece.
+ * 2. The tool's own approval targets, its reading of the arguments, must lie
+ *    inside the copy.
+ * 3. Every piece of the raw path arguments, split on every separator, must
+ *    lie inside the copy too.
+ * None of them depends on which files exist, so the early refusal and the
+ * one right before execution always agree.
  */
 export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unknown, root: string): string | undefined {
 	const targets = (tool.approvalCacheTargets(args) ?? []).map(target => (target.startsWith(TREE_PREFIX) ? target.slice(TREE_PREFIX.length) : target));
+	for (const value of [...rawPathValues(args), ...targets]) {
+		const reason = notOnePlainPath(value);
+		if (reason !== undefined) {
+			return `omp-sandbox: ${toolName} was given ${JSON.stringify(value)}, which contains ${reason}; a file tool may read that as several paths or an encoded one, so omp-sandbox takes one plain path per call. Use one call per file or directory (for a glob, one call per brace alternative).`;
+		}
+	}
 	for (const file of targets) {
 		if (!path.isAbsolute(file)) {
 			if (file.includes("://")) continue; // an internal or web URL, not a file here
@@ -124,6 +138,26 @@ export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unk
 		if (refused !== undefined) return refused;
 	}
 	return undefined;
+}
+
+/** Why `value` is not one plain path (or one plain URL), or undefined when it is. */
+function notOnePlainPath(value: string): string | undefined {
+	if (/file:\/\//i.test(value)) return "a file:// URL";
+	const url = /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
+	if (/[;,]/.test(value)) return "a list separator (; or ,)";
+	if (/[{}]/.test(value)) return "a brace";
+	if (value.includes("\\")) return "a backslash";
+	// A web or internal URL may carry %-escapes; a path may not.
+	if (!url && /%[0-9a-f]{2}/i.test(value)) return "a percent-escape";
+	return undefined;
+}
+
+/** The raw path-like string arguments: `path`, `paths` (one or a list) and `rename`. */
+function rawPathValues(args: unknown): string[] {
+	if (args === null || typeof args !== "object") return [];
+	const fields = args as { path?: unknown; paths?: unknown; rename?: unknown };
+	const values = [fields.path, fields.rename, ...(Array.isArray(fields.paths) ? fields.paths : [fields.paths])];
+	return values.filter((value): value is string => typeof value === "string" && value !== "");
 }
 
 function refusePath(file: string, root: string): string | undefined {
@@ -159,9 +193,7 @@ const MAX_EXPANSIONS = 1024;
  * expands past MAX_EXPANSIONS.
  */
 function rawPathTokens(args: unknown): string[] | undefined {
-	if (args === null || typeof args !== "object") return [];
-	const fields = args as { path?: unknown; paths?: unknown };
-	const values = [fields.path, ...(Array.isArray(fields.paths) ? fields.paths : [fields.paths])].filter((value): value is string => typeof value === "string" && value !== "");
+	const values = rawPathValues(args);
 	const tokens = new Set<string>();
 	const add = (piece: string) => {
 		for (const form of new Set([piece, piece.replaceAll("\\", "")])) {

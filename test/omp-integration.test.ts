@@ -387,47 +387,55 @@ export default function (pi) {
 		expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("host-only");
 	}, 120_000);
 
-	test("every way to name a host file in a read path list is refused; lists inside the copy still work", async () => {
+	test("a path that a file tool could read as several paths, or an encoded one, is refused in every file tool; one plain path still works", async () => {
 		const call = (name: string, args: Record<string, unknown>) => ({ name, arguments: args });
 		const outside = await fs.mkdtemp(path.join(scratch, "outside-"));
 		const secret = path.join(outside, "secret.txt");
 		await fs.writeFile(secret, "HOST-ONLY-SECRET");
 		const hostDir = await freshHostDir();
-		const leaking = [
-			`nope.txt;${secret}`,
-			`nope.txt,${secret}`,
-			`"nope.txt;${secret}"`,
-			`nope.txt ${secret}`,
-			// An internal URL first, then a host path.
-			`local://nope.txt;${secret}`,
-			// A file:// URL whose list separator is percent-encoded.
-			`file://${hostDir}/a.txt%3B${secret}`,
-			`file://${hostDir}/a.txt%2C${secret}`,
-			// A backslash-escaped brace: read gives it no meaning, so its commas separate.
-			`a\\{b,${secret},c}`,
+		// One case per refused class; each pairs a file inside the copy with the host file.
+		const classes: Record<string, string> = {
+			semicolon: `a.txt;${secret}`,
+			comma: `a.txt,${secret}`,
+			brace: `{a.txt,${secret}}`,
+			backslash: `a\\{b,${secret},c}`,
+			"percent-escape": `a.txt%3B${secret}`,
+			"file URL": `file://${hostDir}/a.txt%3B${secret}`,
+		};
+		const asCall: Record<string, (p: string) => ScriptedCall> = {
+			read: p => call("read", { path: p }),
+			grep: p => call("grep", { pattern: "SECRET", path: p }),
+			glob: p => call("glob", { path: p }),
+			write: p => call("write", { path: p, content: "planted" }),
+			edit: p => call("edit", { input: `[${p}#ABCD]\nPUT 1.=1:\n+planted` }),
+		};
+		const cases = Object.entries(classes).flatMap(([kind, p]) => Object.entries(asCall).map(([tool, make]) => ({ kind, tool, call: make(p) })));
+		// Plain single paths, a name with a space, a glob and an internal URL keep working.
+		const plain = [
+			call("read", { path: "a.txt" }),
+			call("read", { path: "sub dir/b c.txt" }),
+			call("grep", { pattern: "inside", path: "sub dir" }),
+			call("glob", { path: "sub dir/*.txt" }),
+			call("write", { path: "new.txt", content: "made\n" }),
 		];
-		const run = await runOmp(
-			[...leaking.map(p => call("read", { path: p })), call("read", { path: "a.txt;sub/b.txt" }), call("glob", { path: "{sub,other}/*.txt" })],
-			{},
-			{ "a.txt": "inside A\n", "sub/b.txt": "inside B\n" },
-			hostDir,
-		);
+		const run = await runOmp([...cases.map(c => c.call), ...plain], {}, { "a.txt": "inside A\n", "sub dir/b c.txt": "inside B\n" }, hostDir);
 		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
-		leaking.forEach((_, index) => {
+		cases.forEach(({ kind, tool }, index) => {
 			const end = byId.get(`call_${index}`);
-			expect(end?.isError).toBe(true);
+			expect({ kind, tool, isError: end?.isError }).toEqual({ kind, tool, isError: true });
+			expect(end?.text).toContain("one plain path per call");
 			expect(end?.text).not.toContain("HOST-ONLY-SECRET");
 		});
-		// A list of files inside the copy still reads both.
-		const inside = byId.get(`call_${leaking.length}`);
-		expect(inside?.isError).toBe(false);
-		expect(inside?.text).toContain("inside A");
-		expect(inside?.text).toContain("inside B");
-		// A brace glob inside the copy still runs: alternatives are expanded, not split apart.
-		const braces = byId.get(`call_${leaking.length + 1}`);
-		expect(braces?.isError).toBe(false);
-		expect(braces?.text).toContain("b.txt");
-	}, 120_000);
+		const results = plain.map((_, index) => byId.get(`call_${cases.length + index}`));
+		expect(results.map(end => end?.isError)).toEqual([false, false, false, false, false]);
+		expect(results[0]?.text).toContain("inside A");
+		expect(results[1]?.text).toContain("inside B");
+		expect(results[2]?.text).toContain("b c.txt");
+		expect(results[3]?.text).toContain("b c.txt");
+		expect(await fs.readFile(path.join(run.sandboxDir, "new.txt"), "utf8")).toBe("made\n");
+		expect(await fs.readdir(outside)).toEqual(["secret.txt"]);
+		expect(await fs.readFile(secret, "utf8")).toBe("HOST-ONLY-SECRET");
+	}, 180_000);
 
 	test("an interactive approval prompt shows the command the agent wrote, as for native bash, and its answer is followed", async () => {
 		// RPC mode with always-ask: each bash call raises omp's approval prompt.
