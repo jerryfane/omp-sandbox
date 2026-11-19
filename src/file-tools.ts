@@ -115,7 +115,9 @@ export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unk
 		const refused = refusePath(file, root);
 		if (refused !== undefined) return refused;
 	}
-	for (const token of rawPathTokens(args)) {
+	const tokens = rawPathTokens(args);
+	if (tokens === undefined) return `omp-sandbox: ${toolName}'s path arguments expand to too many paths to check; refusing it`;
+	for (const token of tokens) {
 		if (token.startsWith("~") && token !== "~" && !token.startsWith("~/")) return `omp-sandbox: cannot tell where ${JSON.stringify(token)} is; refusing ${toolName}`;
 		const file = token === "~" || token.startsWith("~/") ? path.join(os.homedir(), token.slice(1)) : path.resolve(root, token);
 		const refused = refusePath(file, root);
@@ -134,16 +136,22 @@ function refusePath(file: string, root: string): string | undefined {
 	return undefined;
 }
 
-/** Characters any omp file tool may treat as a path-list separator, plus glob braces. */
+/** Characters any omp file tool may treat as a path-list separator; braces left after expansion are unbalanced and split too. */
 const TOKEN_SPLIT = /[;,\s\u200b{}]+/u;
 
+/** How many paths one argument may expand to (brace alternatives multiply) before the call is refused. */
+const MAX_EXPANSIONS = 1024;
+
 /**
- * Every path-like token in the raw `path` and `paths` arguments, split on
- * every separator, also after percent-decoding and removing `file://`
- * prefixes. Prefixes omp strips (`@`, a stray `:`, quotes) are removed. URLs
- * other than file:// and `!glob` exclusions are left out.
+ * Every path-like token in the raw `path` and `paths` arguments: brace
+ * alternatives expanded with their prefix and suffix (`{src,test}/x` is
+ * `src/x` and `test/x`), then split on every separator, also after
+ * percent-decoding and removing `file://` prefixes. Prefixes omp strips (`@`,
+ * a stray `:`, quotes) are removed. URLs other than file:// and `!glob`
+ * exclusions are left out. Undefined when an argument expands past
+ * MAX_EXPANSIONS.
  */
-function rawPathTokens(args: unknown): string[] {
+function rawPathTokens(args: unknown): string[] | undefined {
 	if (args === null || typeof args !== "object") return [];
 	const fields = args as { path?: unknown; paths?: unknown };
 	const values = [fields.path, ...(Array.isArray(fields.paths) ? fields.paths : [fields.paths])].filter((value): value is string => typeof value === "string" && value !== "");
@@ -152,7 +160,9 @@ function rawPathTokens(args: unknown): string[] {
 		const variants = new Set([value, decodeLoosely(value)]);
 		for (const variant of [...variants]) variants.add(variant.replace(/file:\/\/(localhost)?/gi, ""));
 		for (const variant of variants) {
-			for (const piece of variant.split(TOKEN_SPLIT)) {
+			const expanded = expandBraces(variant);
+			if (expanded === undefined) return undefined;
+			for (const piece of expanded.flatMap(text => text.split(TOKEN_SPLIT))) {
 				const token = piece.replace(/^["'`]+|["'`]+$/g, "").replace(/^@/, "").replace(/^:(?=[/\\~.])/, "");
 				if (token === "" || token.startsWith("!") || /^[a-z][a-z0-9+.-]*:\/\//i.test(token)) continue;
 				tokens.add(token);
@@ -160,6 +170,58 @@ function rawPathTokens(args: unknown): string[] {
 		}
 	}
 	return [...tokens];
+}
+
+/**
+ * `text` with every balanced brace group expanded to its comma-separated
+ * alternatives, each with the group's prefix and suffix; a group with no
+ * comma is its one alternative. An unbalanced brace is left as it is (then
+ * split as a separator). Undefined past MAX_EXPANSIONS results.
+ */
+function expandBraces(text: string): string[] | undefined {
+	const out: string[] = [];
+	const pending = [text];
+	while (pending.length > 0) {
+		const current = pending.pop() as string;
+		const group = firstBraceGroup(current);
+		if (group === undefined) {
+			out.push(current);
+			if (out.length > MAX_EXPANSIONS) return undefined;
+			continue;
+		}
+		const prefix = current.slice(0, group.open);
+		const suffix = current.slice(group.close + 1);
+		for (const alternative of group.alternatives) pending.push(prefix + alternative + suffix);
+		if (out.length + pending.length > MAX_EXPANSIONS) return undefined;
+	}
+	return out;
+}
+
+/** The first `{` that has a matching `}`, and its top-level comma-separated alternatives. */
+function firstBraceGroup(text: string): { open: number; close: number; alternatives: string[] } | undefined {
+	for (let open = text.indexOf("{"); open !== -1; open = text.indexOf("{", open + 1)) {
+		let depth = 0;
+		let start = open + 1;
+		const alternatives: string[] = [];
+		for (let i = open; i < text.length; i++) {
+			const ch = text[i];
+			if (ch === "\\") {
+				i++;
+			} else if (ch === "{") {
+				depth++;
+			} else if (ch === "}") {
+				depth--;
+				if (depth === 0) {
+					alternatives.push(text.slice(start, i));
+					return { open, close: i, alternatives };
+				}
+			} else if (ch === "," && depth === 1) {
+				alternatives.push(text.slice(start, i));
+				start = i + 1;
+			}
+		}
+	}
+	return undefined;
 }
 
 /** Percent-decoding that never throws: a malformed escape is kept as it is. */

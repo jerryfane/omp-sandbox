@@ -404,7 +404,12 @@ export default function (pi) {
 			`file://${hostDir}/a.txt%3B${secret}`,
 			`file://${hostDir}/a.txt%2C${secret}`,
 		];
-		const run = await runOmp([...leaking.map(p => call("read", { path: p })), call("read", { path: "a.txt;sub/b.txt" })], {}, { "a.txt": "inside A\n", "sub/b.txt": "inside B\n" }, hostDir);
+		const run = await runOmp(
+			[...leaking.map(p => call("read", { path: p })), call("read", { path: "a.txt;sub/b.txt" }), call("glob", { path: "{sub,other}/*.txt" })],
+			{},
+			{ "a.txt": "inside A\n", "sub/b.txt": "inside B\n" },
+			hostDir,
+		);
 		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
 		leaking.forEach((_, index) => {
 			const end = byId.get(`call_${index}`);
@@ -416,6 +421,10 @@ export default function (pi) {
 		expect(inside?.isError).toBe(false);
 		expect(inside?.text).toContain("inside A");
 		expect(inside?.text).toContain("inside B");
+		// A brace glob inside the copy still runs: alternatives are expanded, not split apart.
+		const braces = byId.get(`call_${leaking.length + 1}`);
+		expect(braces?.isError).toBe(false);
+		expect(braces?.text).toContain("b.txt");
 	}, 120_000);
 
 	test("an interactive approval prompt shows the command the agent wrote, as for native bash, and its answer is followed", async () => {
