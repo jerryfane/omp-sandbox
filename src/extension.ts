@@ -149,7 +149,7 @@ export default async function ompSandbox(pi: ExtensionAPI): Promise<void> {
 		if (typeof ready === "string") return { block: true, reason: ready };
 		const native = isFileTool(event.toolName) ? natives?.fileTools.get(event.toolName)?.native : undefined;
 		if (native !== undefined) {
-			const refused = await refuseFileCall(native, event.toolName, event.input, ready.mirror.hostRoot);
+			const refused = refuseFileCall(native, event.toolName, event.input, ready.mirror.hostRoot);
 			if (refused !== undefined) return { block: true, reason: refused };
 		}
 		return undefined;
@@ -247,8 +247,8 @@ function fileShadow(name: FileToolName, native: NativeFileTool, allowed: boolean
 			if (ctx.invokeTool === undefined) throw new Error(`omp-sandbox: omp's native ${name} is not available to delegate to`);
 			// Picks up what background bash jobs changed since the last sync.
 			await ready.mirror.pullRemote();
-			// Checked after the pull, right before the tool runs: how read splits a path list depends on which files exist.
-			const refused = await refuseFileCall(native, name, params, ready.mirror.hostRoot);
+			// Checked again right before the tool runs, after the pull.
+			const refused = refuseFileCall(native, name, params, ready.mirror.hostRoot);
 			if (refused !== undefined) throw new Error(refused);
 			const result = await ctx.invokeTool(params, { signal, onUpdate });
 			try {

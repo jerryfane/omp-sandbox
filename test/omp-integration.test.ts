@@ -61,14 +61,15 @@ async function freshSandbox(seed: Record<string, string> = {}): Promise<string> 
 	return dir;
 }
 
-/** Runs omp once with the given script of tool calls, in a fresh host copy and sandbox; returns what the session did. */
+/** Runs omp once with the given script of tool calls, in a fresh host copy (or `hostDir`, empty) and sandbox; returns what the session did. */
 async function runOmp(
 	script: (ScriptedCall | ScriptedCall[])[],
 	extraEnv: Record<string, string> = {},
 	seed: Record<string, string> = {},
+	emptyHostDir?: string,
 ): Promise<Run> {
 	const dir = import.meta.dir;
-	const hostDir = await freshHostDir();
+	const hostDir = emptyHostDir ?? (await freshHostDir());
 	const sandboxDir = await freshSandbox(seed);
 	const child = Bun.spawn(
 		[
@@ -386,31 +387,35 @@ export default function (pi) {
 		expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("host-only");
 	}, 120_000);
 
-	test("a read path list is checked member by member: a host file in a ;, comma or quoted list is refused", async () => {
+	test("every way to name a host file in a read path list is refused; lists inside the copy still work", async () => {
 		const call = (name: string, args: Record<string, unknown>) => ({ name, arguments: args });
 		const outside = await fs.mkdtemp(path.join(scratch, "outside-"));
 		const secret = path.join(outside, "secret.txt");
 		await fs.writeFile(secret, "HOST-ONLY-SECRET");
-		const run = await runOmp(
-			[
-				call("read", { path: `nope.txt;${secret}` }),
-				call("read", { path: `nope.txt,${secret}` }),
-				call("read", { path: `"nope.txt;${secret}"` }),
-				call("read", { path: `a.txt;sub/b.txt` }),
-			],
-			{},
-			{ "a.txt": "inside A\n", "sub/b.txt": "inside B\n" },
-		);
+		const hostDir = await freshHostDir();
+		const leaking = [
+			`nope.txt;${secret}`,
+			`nope.txt,${secret}`,
+			`"nope.txt;${secret}"`,
+			`nope.txt ${secret}`,
+			// An internal URL first, then a host path.
+			`local://nope.txt;${secret}`,
+			// A file:// URL whose list separator is percent-encoded.
+			`file://${hostDir}/a.txt%3B${secret}`,
+			`file://${hostDir}/a.txt%2C${secret}`,
+		];
+		const run = await runOmp([...leaking.map(p => call("read", { path: p })), call("read", { path: "a.txt;sub/b.txt" })], {}, { "a.txt": "inside A\n", "sub/b.txt": "inside B\n" }, hostDir);
 		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
-		for (const id of ["call_0", "call_1", "call_2"]) {
-			expect(byId.get(id)?.isError).toBe(true);
-			expect(byId.get(id)?.text).toContain("outside the sandboxed workspace");
-			expect(byId.get(id)?.text).not.toContain("HOST-ONLY-SECRET");
-		}
+		leaking.forEach((_, index) => {
+			const end = byId.get(`call_${index}`);
+			expect(end?.isError).toBe(true);
+			expect(end?.text).not.toContain("HOST-ONLY-SECRET");
+		});
 		// A list of files inside the copy still reads both.
-		expect(byId.get("call_3")?.isError).toBe(false);
-		expect(byId.get("call_3")?.text).toContain("inside A");
-		expect(byId.get("call_3")?.text).toContain("inside B");
+		const inside = byId.get(`call_${leaking.length}`);
+		expect(inside?.isError).toBe(false);
+		expect(inside?.text).toContain("inside A");
+		expect(inside?.text).toContain("inside B");
 	}, 120_000);
 
 	test("an interactive approval prompt shows the command the agent wrote, as for native bash, and its answer is followed", async () => {

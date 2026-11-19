@@ -9,9 +9,9 @@
  * `approvalCacheTargets` decides whether a call stays inside the copy: the
  * reading of the arguments omp's approval gate uses.
  */
+import * as os from "node:os";
 import * as path from "node:path";
 import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
-import { splitDelimitedPathEntry } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 
 /**
  * The file tools that run on the host copy, one entry each: the only list.
@@ -94,59 +94,83 @@ const TREE_PREFIX = "tree\0";
 /**
  * Why a file-tool call must not run against the copy at `root`, or undefined
  * when every path it touches is inside it. Internal and web URLs are not
- * workspace paths and are left to the tool. Run it right before the tool
- * executes: how `read` splits a path list depends on which files exist.
+ * workspace paths and are left to the tool.
+ *
+ * Two checks. The tool's own approval targets, its reading of the arguments.
+ * And a lexical one over the raw path arguments, because `read` takes a path
+ * list that it splits only at execution (`;`, `,`, whitespace, after decoding
+ * a file:// URL, around internal URLs), which its approval target does not
+ * show. The lexical check splits more than any tool does and needs no
+ * filesystem state, so it gives the same answer whenever it runs: a path that
+ * holds a delimiter followed by an outside path is refused even when it names
+ * a real file inside the copy.
  */
-export async function refuseFileCall(tool: NativeFileTool, toolName: string, args: unknown, root: string): Promise<string | undefined> {
-	let targets: readonly string[];
-	try {
-		targets = await executionTargets(tool, toolName, args, root, 0);
-	} catch (error) {
-		if (error instanceof UnresolvedList) return `omp-sandbox: cannot tell which paths ${toolName} would read from ${JSON.stringify(error.entry)}; refusing it`;
-		throw error;
-	}
-	for (const target of targets) {
-		const file = target.startsWith(TREE_PREFIX) ? target.slice(TREE_PREFIX.length) : target;
+export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unknown, root: string): string | undefined {
+	const targets = (tool.approvalCacheTargets(args) ?? []).map(target => (target.startsWith(TREE_PREFIX) ? target.slice(TREE_PREFIX.length) : target));
+	for (const file of targets) {
 		if (!path.isAbsolute(file)) {
 			if (file.includes("://")) continue; // an internal or web URL, not a file here
 			return `omp-sandbox: cannot tell where ${JSON.stringify(file)} is; refusing ${toolName}`;
 		}
-		if (!isInside(root, file)) {
-			return `omp-sandbox: ${file} is outside the sandboxed workspace ${root}; only paths inside it exist in the sandbox`;
-		}
-		if (path.relative(root, path.resolve(file)).split(path.sep).some(part => part.toLowerCase() === ".git")) {
-			return `omp-sandbox: ${file} is inside a .git directory, which is not copied from the sandbox; use git through bash instead`;
-		}
+		const refused = refusePath(file, root);
+		if (refused !== undefined) return refused;
+	}
+	for (const token of rawPathTokens(args)) {
+		if (token.startsWith("~") && token !== "~" && !token.startsWith("~/")) return `omp-sandbox: cannot tell where ${JSON.stringify(token)} is; refusing ${toolName}`;
+		const file = token === "~" || token.startsWith("~/") ? path.join(os.homedir(), token.slice(1)) : path.resolve(root, token);
+		const refused = refusePath(file, root);
+		if (refused !== undefined) return refused;
 	}
 	return undefined;
 }
 
-/** How deep a `read` path list may nest (a list whose members are lists) before the call is refused. */
-const MAX_LIST_DEPTH = 4;
-
-class UnresolvedList extends Error {
-	constructor(readonly entry: string) {
-		super(`path list nests deeper than ${MAX_LIST_DEPTH}`);
+function refusePath(file: string, root: string): string | undefined {
+	if (!isInside(root, file)) {
+		return `omp-sandbox: ${file} is outside the sandboxed workspace ${root}; only paths inside it exist in the sandbox`;
 	}
+	if (path.relative(root, path.resolve(file)).split(path.sep).some(part => part.toLowerCase() === ".git")) {
+		return `omp-sandbox: ${file} is inside a .git directory, which is not copied from the sandbox; use git through bash instead`;
+	}
+	return undefined;
 }
 
+/** Characters any omp file tool may treat as a path-list separator, plus glob braces. */
+const TOKEN_SPLIT = /[;,\s\u200b{}]+/u;
+
 /**
- * Every path a call can reach. The tool's approval targets name what one call
- * reads, but `read` also accepts a path list (`a;b`, `a,b`, a quoted list): a
- * path that is not itself a file is split with omp's own splitter and each
- * member read on its own, while its approval target stays the whole string.
- * So for `read`, every member's targets count too.
+ * Every path-like token in the raw `path` and `paths` arguments, split on
+ * every separator, also after percent-decoding and removing `file://`
+ * prefixes. Prefixes omp strips (`@`, a stray `:`, quotes) are removed. URLs
+ * other than file:// and `!glob` exclusions are left out.
  */
-async function executionTargets(tool: NativeFileTool, toolName: string, args: unknown, root: string, depth: number): Promise<string[]> {
-	const targets = [...(tool.approvalCacheTargets(args) ?? [])];
-	if (toolName !== "read") return targets;
-	const raw = args !== null && typeof args === "object" && "path" in args ? String((args as { path?: unknown }).path ?? "") : "";
-	if (raw === "") return targets;
-	const parts = await splitDelimitedPathEntry(raw, root);
-	if (parts === null) return targets;
-	if (depth >= MAX_LIST_DEPTH) throw new UnresolvedList(raw);
-	for (const part of parts) targets.push(...(await executionTargets(tool, toolName, { ...(args as object), path: part }, root, depth + 1)));
-	return targets;
+function rawPathTokens(args: unknown): string[] {
+	if (args === null || typeof args !== "object") return [];
+	const fields = args as { path?: unknown; paths?: unknown };
+	const values = [fields.path, ...(Array.isArray(fields.paths) ? fields.paths : [fields.paths])].filter((value): value is string => typeof value === "string" && value !== "");
+	const tokens = new Set<string>();
+	for (const value of values) {
+		const variants = new Set([value, decodeLoosely(value)]);
+		for (const variant of [...variants]) variants.add(variant.replace(/file:\/\/(localhost)?/gi, ""));
+		for (const variant of variants) {
+			for (const piece of variant.split(TOKEN_SPLIT)) {
+				const token = piece.replace(/^["'`]+|["'`]+$/g, "").replace(/^@/, "").replace(/^:(?=[/\\~.])/, "");
+				if (token === "" || token.startsWith("!") || /^[a-z][a-z0-9+.-]*:\/\//i.test(token)) continue;
+				tokens.add(token);
+			}
+		}
+	}
+	return [...tokens];
+}
+
+/** Percent-decoding that never throws: a malformed escape is kept as it is. */
+function decodeLoosely(text: string): string {
+	return text.replace(/(%[0-9a-f]{2})+/gi, run => {
+		try {
+			return decodeURIComponent(run);
+		} catch {
+			return run;
+		}
+	});
 }
 
 function isInside(root: string, file: string): boolean {
