@@ -146,6 +146,43 @@ describe("Mirror", () => {
 		expect(await fs.readFile(path.join(host, "c.txt"), "utf8")).toBe("host");
 	});
 
+	/** Rewrite a sandbox file keeping its size and its exact mtime (a whole second, so nothing is rounded). */
+	async function editKeepingMtime(rel: string, content: string): Promise<void> {
+		await put(sandbox, rel, content);
+		await fs.utimes(path.join(sandbox, rel), 1_000_000_000, 1_000_000_000);
+	}
+
+	test("a sandbox edit that keeps the size and mtime still reaches the copy", async () => {
+		await editKeepingMtime("s.txt", "aaaa");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await editKeepingMtime("s.txt", "bbbb");
+		await mirror.pullRemote();
+		expect(await fs.readFile(path.join(host, "s.txt"), "utf8")).toBe("bbbb");
+	});
+
+	test("a push is refused when the sandbox edited the same file keeping its size and mtime", async () => {
+		await editKeepingMtime("s.txt", "aaaa");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await editKeepingMtime("s.txt", "bbbb");
+		await tick();
+		await put(host, "s.txt", "host");
+		await expect(mirror.pushLocal()).rejects.toThrow(/s\.txt/);
+		expect(await fs.readFile(path.join(sandbox, "s.txt"), "utf8")).toBe("bbbb");
+	});
+
+	test("a sandbox file touched without a change is not a conflict for a local edit elsewhere or to it", async () => {
+		await put(sandbox, "t.txt", "same");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await tick();
+		await fs.utimes(path.join(sandbox, "t.txt"), new Date(), new Date());
+		await put(host, "t.txt", "host edit");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(sandbox, "t.txt"), "utf8")).toBe("host edit");
+	});
+
 	test("a push checks the sandbox first: a file changed on both sides is not overwritten there", async () => {
 		await put(sandbox, "c.txt", "base");
 		const mirror = await Mirror.create(backend, host);

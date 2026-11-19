@@ -472,6 +472,28 @@ export default function (pi) {
 		expect(await Bun.file("/tmp/omp-sandbox-must-not-run").exists()).toBe(false);
 	}, 120_000);
 
+	test("a model-specific edit variant gives the shadow the same contract as native edit", async () => {
+		// edit.modelVariants picks replace-mode edit for the scripted model; the shadow's schema and the
+		// native tool it runs must follow the session's model, not a default.
+		const agentDir = path.join(scratch, "agent-replace-edit");
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.writeFile(path.join(agentDir, "config.yml"), "async:\n  printWake: true\nedit:\n  modelVariants:\n    scripted: replace\n");
+		const run = await runOmp(
+			[{ name: "edit", arguments: { path: "r.txt", old_string: "before", new_string: "after" } }],
+			{ PI_CODING_AGENT_DIR: agentDir },
+			{ "r.txt": "before\n" },
+		);
+		expect(run.ends[0]?.isError).toBe(false);
+		expect(await fs.readFile(path.join(run.sandboxDir, "r.txt"), "utf8")).toBe("after\n");
+	}, 120_000);
+
+	test("read's documentation topics work through the shadow", async () => {
+		const run = await runOmp([{ name: "read", arguments: { path: "xd://read/sources" } }]);
+		expect(run.ends[0]?.isError).toBe(false);
+		expect(run.ends[0]?.text).not.toContain("has no doc topics");
+		expect(run.ends[0]?.text.length).toBeGreaterThan(200);
+	}, 120_000);
+
 	test("a host copy that is not empty at start refuses bash and the file tools", async () => {
 		const hostDir = await freshHostDir();
 		await fs.writeFile(path.join(hostDir, "stray.txt"), "x");

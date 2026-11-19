@@ -47,6 +47,8 @@ import type {
 	ExtensionAPI,
 	NativeFileTool,
 	OmpSettings,
+	OmpModel,
+	SessionEventContext,
 	ToolApprovalDecision,
 	ToolDefinition,
 	ToolResultContent,
@@ -68,12 +70,12 @@ Not available here: \`pty\` and named services (\`name\`/\`ready\`), which would
 /**
  * The native file-tool members a shadow forwards: what the model and the
  * approval gate see. Members that let a call act outside `execute`
- * (openArgStream, speculation, docTopics, matcher*, completeImageRequest) are
- * not forwarded, so every effect goes through the shadow's checks.
+ * (openArgStream, speculation, matcher*, completeImageRequest) are not
+ * forwarded, so every effect goes through the shadow's checks.
  */
 const FORWARDED = ["label", "description", "parameters", "loadMode", "strict", "summary", "examples", "mode", "customFormat", "customWireName", "readsSkillUris"] as const;
-/** Forwarded methods, called on the native instance. */
-const FORWARDED_METHODS = ["approvalCacheTargets", "formatApprovalDetails"] as const;
+/** Forwarded methods, called on the native instance. `docTopics` is read's documentation (xd://read/…), no file access. */
+const FORWARDED_METHODS = ["approvalCacheTargets", "formatApprovalDetails", "docTopics"] as const;
 
 /** The built-in bash's parameters (omp 18.20), as the model sends them. */
 interface BashParams {
@@ -103,11 +105,23 @@ export default async function ompSandbox(pi: ExtensionAPI): Promise<void> {
 	const kind = process.env.OMP_SANDBOX_BACKEND;
 	if (kind === undefined || kind === "") return;
 
+	// The session's current model, kept current from session events: the native
+	// file tools pick their contract from it (edit's mode and description follow
+	// `edit.modelVariants`), and the native instance a shadow delegates to
+	// reads the same model, so both must agree.
+	let currentModel: OmpModel | undefined;
+	const trackModel = async (_event: unknown, ctx: SessionEventContext) => {
+		if (ctx.model !== undefined) currentModel = ctx.model;
+	};
+	pi.on("session_start", trackModel);
+	pi.on("before_agent_start", trackModel);
+	pi.on("turn_start", trackModel);
+
 	let natives: Natives | undefined;
 	let sandbox: Sandbox | undefined;
 	let setupError: string | undefined;
 	try {
-		natives = await loadNatives(process.cwd());
+		natives = await loadNatives(process.cwd(), () => currentModel);
 		sandbox = await createSandbox(kind);
 	} catch (error) {
 		setupError = errorMessage(error);
@@ -265,9 +279,17 @@ function errorMessage(error: unknown): string {
 }
 
 /** omp's own pieces the shadows are built from. */
-async function loadNatives(cwd: string): Promise<Natives> {
+async function loadNatives(cwd: string, model: () => OmpModel | undefined): Promise<Natives> {
 	const { approve, approvalDetails, settings } = await loadBashApproval();
-	const fileTools = await loadFileTools({ cwd, settings });
+	const fileTools = await loadFileTools({
+		cwd,
+		settings,
+		getActiveModel: model,
+		getActiveModelString: () => {
+			const current = model();
+			return current === undefined ? undefined : `${current.provider}/${current.id}`;
+		},
+	});
 	return { approve, approvalDetails, fileTools };
 }
 

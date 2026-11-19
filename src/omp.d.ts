@@ -56,6 +56,21 @@ declare module "@oh-my-pi/pi-coding-agent" {
 	export interface FileToolSession {
 		cwd: string;
 		settings: OmpSettings;
+		/** The session's current model; edit picks its mode and description from it. */
+		getActiveModel?: () => OmpModel | undefined;
+		/** `provider/id` of the current model, as omp formats it. */
+		getActiveModelString?: () => string | undefined;
+	}
+
+	/** A model, as omp passes it to extensions (the fields used here). */
+	export interface OmpModel {
+		provider: string;
+		id: string;
+	}
+
+	/** The context omp passes to session event handlers (the field used here). */
+	export interface SessionEventContext {
+		model?: OmpModel;
 	}
 
 	/** A tool's `approvalCacheTargets`: absolute paths, `tree\0<dir>/` for a recursive search, or URLs. */
@@ -145,6 +160,8 @@ declare module "@oh-my-pi/pi-coding-agent" {
 		registerTool<TParams>(tool: ToolDefinition<TParams>): void;
 		on(event: "tool_call", handler: (event: ToolCallEvent) => Promise<ToolCallEventResult | undefined>): void;
 		on(event: "tool_result", handler: (event: ToolResultEvent) => Promise<ToolResultEventResult | undefined>): void;
+		/** Session start, each prompt and each turn: the context carries the current model. */
+		on(event: "session_start" | "before_agent_start" | "turn_start", handler: (event: unknown, ctx: SessionEventContext) => Promise<void>): void;
 	}
 }
 
