@@ -370,3 +370,78 @@ describe("Mirror", () => {
 		// 600 files on a shared host: well past bun's 5 s default under load.
 	}, 60_000);
 });
+
+describe("Mirror and ignored build output", () => {
+	function git(...args: string[]): void {
+		const run = Bun.spawnSync(["git", "-C", sandbox, ...args], { stdout: "ignore", stderr: "pipe" });
+		if (run.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${run.stderr.toString()}`);
+	}
+
+	test("ignored node_modules and .cache stay out of the copy at any depth; a tracked or unignored one is mirrored", async () => {
+		git("init", "-q");
+		await put(sandbox, ".gitignore", "node_modules/\n.cache/\n");
+		await put(sandbox, "src/a.ts", "a");
+		await put(sandbox, "node_modules/dep/index.js", "dep");
+		await put(sandbox, "pkg/node_modules/inner/x.js", "x");
+		await put(sandbox, ".cache/blob", "c");
+		await put(sandbox, "target/out.txt", "not ignored");
+		await put(sandbox, "vendored/node_modules/kept.js", "tracked");
+		git("add", "-f", "vendored/node_modules/kept.js");
+		let execs = 0;
+		const counting = delegating({ exec: (command, options) => (execs++, backend.exec(command, options)) });
+		const mirror = await Mirror.create(counting, host);
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual([".gitignore=node_modules/\n.cache/\n", "pkg/", "src/", "src/a.ts=a", "target/", "target/out.txt=not ignored", "vendored/", "vendored/node_modules/", "vendored/node_modules/kept.js=tracked"]);
+		expect(execs).toBe(1);
+		expect(mirror.excludes("node_modules")).toBe(true);
+		expect(mirror.excludes("pkg/node_modules/inner/x.js")).toBe(true);
+		expect(mirror.excludes("vendored/node_modules/kept.js")).toBe(false);
+		expect(mirror.excludes("src/a.ts")).toBe(false);
+
+		// Build output changing in the sandbox costs no further git call, and never reaches the copy.
+		await tick();
+		await put(sandbox, "node_modules/dep/index.js", "dep v2");
+		await put(sandbox, "node_modules/new/y.js", "y");
+		await mirror.pullRemote();
+		expect(execs).toBe(1);
+		expect(await Bun.file(path.join(host, "node_modules")).exists()).toBe(false);
+
+		// A host edit is sent, and the sandbox's build output is left alone.
+		await put(host, "src/a.ts", "a2");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(sandbox, "src/a.ts"), "utf8")).toBe("a2");
+		expect(await fs.readFile(path.join(sandbox, "node_modules/dep/index.js"), "utf8")).toBe("dep v2");
+		expect(await fs.readFile(path.join(sandbox, ".cache/blob"), "utf8")).toBe("c");
+	}, 60_000);
+
+	test("a .gitignore change moves a build directory out of the copy, and back in when it is no longer ignored", async () => {
+		git("init", "-q");
+		await put(sandbox, "src/main.rs", "fn main() {}");
+		await put(sandbox, "target/debug/app", "binary");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		expect(await fs.readFile(path.join(host, "target/debug/app"), "utf8")).toBe("binary");
+
+		await put(sandbox, ".gitignore", "target/\n");
+		await mirror.pullRemote();
+		expect(await Bun.file(path.join(host, "target")).exists()).toBe(false);
+		expect(mirror.excludes("target/debug/app")).toBe(true);
+		// Not a host delete: the sandbox keeps it.
+		await put(host, "src/main.rs", "fn main() { }");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(sandbox, "target/debug/app"), "utf8")).toBe("binary");
+
+		await fs.rm(path.join(sandbox, ".gitignore"));
+		await mirror.pullRemote();
+		expect(await fs.readFile(path.join(host, "target/debug/app"), "utf8")).toBe("binary");
+		expect(mirror.excludes("target")).toBe(false);
+	}, 60_000);
+
+	test("outside a git work tree nothing is excluded", async () => {
+		await put(sandbox, "node_modules/dep/index.js", "dep");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		expect(await fs.readFile(path.join(host, "node_modules/dep/index.js"), "utf8")).toBe("dep");
+		expect(mirror.excludes("node_modules")).toBe(false);
+	}, 60_000);
+});

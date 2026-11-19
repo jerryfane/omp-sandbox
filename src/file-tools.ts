@@ -90,12 +90,20 @@ export async function loadFileTools(session: FileToolSession): Promise<ReadonlyM
 /** A recursive search target, as omp keys one: NUL-prefixed "tree", then the folder with a trailing slash. */
 const TREE_PREFIX = "tree\0";
 
+/** The host copy a file-tool call runs against: its root, and what the mirror keeps out of it. */
+export interface FileCopy {
+	hostRoot: string;
+	/** Whether a workspace-relative path is ignored build output, not copied here. */
+	excludes(rel: string): boolean;
+}
+
 /**
- * Why a file-tool call must not run against the copy at `root`, or undefined
- * when every path it touches is inside it. Internal and web URLs are not
+ * Why a file-tool call must not run against the copy, or undefined when every
+ * path it touches is inside it and mirrored. Internal and web URLs are not
  * workspace paths and are left to the tool.
  */
-export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unknown, root: string): string | undefined {
+export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unknown, copy: FileCopy): string | undefined {
+	const root = copy.hostRoot;
 	for (const target of tool.approvalCacheTargets(args) ?? []) {
 		const file = target.startsWith(TREE_PREFIX) ? target.slice(TREE_PREFIX.length) : target;
 		if (!path.isAbsolute(file)) {
@@ -107,6 +115,10 @@ export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unk
 		}
 		if (path.relative(root, path.resolve(file)).split(path.sep).some(part => part.toLowerCase() === ".git")) {
 			return `omp-sandbox: ${file} is inside a .git directory, which is not copied from the sandbox; use git through bash instead`;
+		}
+		const rel = path.relative(root, path.resolve(file)).split(path.sep).join("/");
+		if (rel !== "" && copy.excludes(rel)) {
+			return `omp-sandbox: ${file} is build output that git ignores in the sandbox, so it is not copied here; use bash to work with it`;
 		}
 	}
 	return undefined;

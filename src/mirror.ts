@@ -3,6 +3,7 @@ import { constants, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { Backend, Changes, SyncFile, TreeEntry } from "./backend.ts";
+import { shellQuote } from "./shell.ts";
 
 /** A sync could not keep the host copy and the sandbox consistent; the mirror refuses further work. */
 export class MirrorError extends Error {
@@ -46,6 +47,12 @@ const O_CREATE_NEW = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL |
 const O_READ = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 /** How many conflicting paths a conflict error names. */
 const CONFLICTS_SHOWN = 5;
+/**
+ * Build-output directory names kept out of the host copy, at any depth, when
+ * git ignores them in the sandbox and they hold no tracked file: the point of
+ * a remote workspace is that build output stays off the host's disk.
+ */
+const BUILD_DIRS = new Set(["node_modules", "target", ".cache"]);
 
 /**
  * A host copy of the sandbox's workspace tree, for omp's own file tools to
@@ -54,7 +61,9 @@ const CONFLICTS_SHOWN = 5;
  *
  * Only regular files and directories are mirrored. A sandbox symlink or
  * special file is not created here (a symlink could lead a host tool out of
- * the copy), and `.git` is not mirrored.
+ * the copy), and `.git` is not mirrored. Neither is ignored build output: a
+ * directory in BUILD_DIRS that git ignores in the sandbox and that holds no
+ * tracked file (see `excludes`).
  *
  * Conflicts are never resolved: a path changed on both sides since the last
  * sync, or a host path the mirror would have to delete or overwrite without
@@ -72,6 +81,10 @@ export class Mirror {
 	#token: string | undefined;
 	readonly #known = new Map<string, Known>();
 	#broken: string | undefined;
+	/** Build-output directories git ignores in the sandbox: never mirrored. */
+	readonly #excluded = new Set<string>();
+	/** Directories named like build output that are mirrored (tracked, or not ignored). */
+	readonly #included = new Set<string>();
 	#queue: Promise<unknown> = Promise.resolve();
 
 	private constructor(backend: Backend, hostRoot: string) {
@@ -97,6 +110,16 @@ export class Mirror {
 	/** Why the mirror stopped, once a sync failed. */
 	get broken(): string | undefined {
 		return this.#broken;
+	}
+
+	/**
+	 * Whether the workspace-relative `rel` is, or is inside, a build-output
+	 * directory the mirror keeps out of the copy. Known from the last sync.
+	 */
+	excludes(rel: string): boolean {
+		const parts = rel.split("/");
+		for (let depth = 1; depth <= parts.length; depth++) if (this.#excluded.has(parts.slice(0, depth).join("/"))) return true;
+		return false;
 	}
 
 	/** Bring the host copy up to date with the sandbox. */
@@ -129,7 +152,7 @@ export class Mirror {
 	}
 
 	async #pull(): Promise<void> {
-		const changes = await this.#backend.changes(this.#token);
+		const changes = await this.#screen(await this.#backend.changes(this.#token));
 		await this.#apply(await this.#remoteDelta(changes));
 		this.#token = changes.token;
 	}
@@ -150,7 +173,14 @@ export class Mirror {
 		if (local.size === 0) return;
 
 		// What the sandbox did since the last sync, checked before anything is sent.
-		const changes = await this.#backend.changes(this.#token);
+		const changes = await this.#screen(await this.#backend.changes(this.#token));
+		// A directory that became excluded just now was in the scan; what is under it is not sent.
+		for (const rel of [...local.keys()]) if (this.excludes(rel)) local.delete(rel);
+		if (local.size === 0) {
+			await this.#apply(await this.#remoteDelta(changes));
+			this.#token = changes.token;
+			return;
+		}
 		const remote = await this.#remoteDelta(changes);
 		const conflicts = overlap(local, remote);
 		if (conflicts.length > 0) {
@@ -199,6 +229,122 @@ export class Mirror {
 		// one of these paths (even a delete) is reported. The echo of the push
 		// itself has the content just recorded, so it is not a change.
 		await this.#pull();
+	}
+
+	/** Whether a `.gitignore` that decides what is mirrored is new, gone, or changed in content since the last sync. */
+	async #gitignoreChanged(changes: Changes): Promise<boolean> {
+		const counts = (rel: string) => rel.split("/").at(-1) === ".gitignore" && !this.excludes(rel);
+		const listed = changes.changed.filter(entry => counts(entry.path));
+		const gone = changes.full
+			? [...this.#known.keys()].some(rel => counts(rel) && !listed.some(entry => entry.path === rel))
+			: changes.deleted.some(counts);
+		if (gone) return true;
+		const reported: string[] = [];
+		for (const entry of listed) {
+			if (entry.type !== "file" || this.#known.get(entry.path)?.type !== "file") return true;
+			reported.push(entry.path);
+		}
+		if (reported.length === 0) return false;
+		const pulled = await this.#backend.pull(reported);
+		if (pulled.length !== reported.length) return true;
+		return pulled.some(file => this.#known.get(file.path)?.content !== contentKey(file));
+	}
+
+	/**
+	 * `changes` without ignored build output. A directory named in BUILD_DIRS
+	 * is classified the first time a listing shows it, in one `exec` of git in
+	 * the sandbox for all new ones (outermost first: one inside an excluded
+	 * directory is never asked about). A `.gitignore` outside excluded
+	 * directories that is new, gone, or has new content asks again about
+	 * every one seen (`changes` may report an unchanged one again). One that
+	 * becomes excluded is dropped from the copy; one that stops being excluded
+	 * is filled in by a full listing.
+	 */
+	async #screen(changes: Changes): Promise<Changes> {
+		const paths = [...changes.changed.map(entry => entry.path), ...changes.deleted];
+		const recheck = await this.#gitignoreChanged(changes);
+		const asked = new Set<string>();
+		let reopened = false;
+		for (;;) {
+			const ask = new Set<string>();
+			for (const rel of paths) {
+				const dir = this.#candidate(rel, recheck ? asked : undefined);
+				if (dir !== undefined) ask.add(dir);
+			}
+			if (recheck && asked.size === 0) for (const dir of [...this.#excluded, ...this.#included]) ask.add(dir);
+			if (ask.size === 0) break;
+			for (const [dir, excluded] of await this.#askGit([...ask])) {
+				asked.add(dir);
+				if (excluded) {
+					this.#included.delete(dir);
+					if (!this.#excluded.has(dir)) {
+						this.#excluded.add(dir);
+						await this.#forget(dir);
+					}
+				} else {
+					if (this.#excluded.delete(dir)) reopened = true;
+					this.#included.add(dir);
+				}
+			}
+		}
+		// What was kept out is now mirrored: only a full listing brings it in.
+		if (reopened) return this.#screen(await this.#backend.changes());
+		return {
+			...changes,
+			changed: changes.changed.filter(entry => !this.excludes(entry.path)),
+			deleted: changes.deleted.filter(rel => !this.excludes(rel)),
+		};
+	}
+
+	/**
+	 * The outermost directory on `rel`'s path named in BUILD_DIRS that still
+	 * needs classifying, if any. None inside an excluded one; past one known
+	 * to be mirrored. With `recheck`, one classified before this sync counts
+	 * as unclassified until asked again.
+	 */
+	#candidate(rel: string, recheck: ReadonlySet<string> | undefined): string | undefined {
+		const parts = rel.split("/");
+		for (let depth = 1; depth <= parts.length; depth++) {
+			if (!BUILD_DIRS.has(parts[depth - 1] as string)) continue;
+			const dir = parts.slice(0, depth).join("/");
+			// A path inside a build-output directory has it as a parent; the entry itself may be a file named like one.
+			const isDir = depth < parts.length;
+			if (recheck !== undefined && !recheck.has(dir) && isDir) return dir;
+			if (this.#excluded.has(dir)) return undefined;
+			if (this.#included.has(dir)) continue;
+			if (isDir) return dir;
+		}
+		return undefined;
+	}
+
+	/** For each directory: whether git ignores it in the sandbox and it holds no tracked file. */
+	async #askGit(dirs: readonly string[]): Promise<Map<string, boolean>> {
+		const script = [
+			// Not a git work tree: nothing is ignored, so everything is mirrored.
+			"git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0",
+			`for d in ${dirs.map(shellQuote).join(" ")}; do`,
+			`  if git check-ignore -q -- "$d/" && [ -z "$(git ls-files -- "$d" | head -c 1)" ]; then printf 1; else printf 0; fi`,
+			"done",
+		].join("\n");
+		const result = await this.#backend.exec(script, { cwd: this.#backend.root, timeoutMs: 60_000 });
+		const answer = result.exitCode === 0 && result.stdout === "" ? "0".repeat(dirs.length) : result.stdout;
+		if (result.exitCode !== 0 || !new RegExp(`^[01]{${dirs.length}}$`).test(answer)) {
+			throw new MirrorError(`cannot tell which build output git ignores in the sandbox (exit ${result.exitCode ?? result.signal}): ${result.stderr.trim().slice(0, 200)}`);
+		}
+		return new Map(dirs.map((dir, index) => [dir, answer[index] === "1"]));
+	}
+
+	/** Stop mirroring `dir`: the host files the mirror synced under it go (unless changed here), and it stops tracking all of them. */
+	async #forget(dir: string): Promise<void> {
+		const under = [...this.#known.keys()].filter(rel => rel === dir || rel.startsWith(`${dir}/`)).sort(deepestFirst);
+		for (const rel of under) {
+			try {
+				await this.#removeHost(rel, "ignored build output in the sandbox");
+			} catch (error) {
+				if (!(error instanceof MirrorError)) throw error;
+			}
+			this.#known.delete(rel);
+		}
 	}
 
 	/**
@@ -375,6 +521,7 @@ export class Mirror {
 			for (const name of await fs.readdir(dir)) {
 				if (isGitName(name)) continue;
 				const childRel = rel === "" ? name : `${rel}/${name}`;
+				if (this.excludes(childRel)) continue;
 				const info = await lstatOrUndefined(path.join(dir, name));
 				if (info === undefined) continue;
 				if (info.isDirectory()) {

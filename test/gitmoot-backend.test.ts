@@ -164,7 +164,8 @@ describe("GitmootBackend", () => {
 			const line = await runLine(backend.shellCommand("pwd", { cwd: path.join(root, name) }));
 			expect(line.stdout).toBe(`${path.join(root, name)}\n`);
 		}
-	});
+		// Six stand-in CLI calls: past bun's 5 s default when the host is loaded.
+	}, 60_000);
 
 	test("a group member that ignores SIGTERM is still killed about 3 s after a cancel", async () => {
 		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });

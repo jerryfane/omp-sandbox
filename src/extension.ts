@@ -149,7 +149,7 @@ export default async function ompSandbox(pi: ExtensionAPI): Promise<void> {
 		if (typeof ready === "string") return { block: true, reason: ready };
 		const native = isFileTool(event.toolName) ? natives?.fileTools.get(event.toolName)?.native : undefined;
 		if (native !== undefined) {
-			const refused = refuseFileCall(native, event.toolName, event.input, ready.mirror.hostRoot);
+			const refused = refuseFileCall(native, event.toolName, event.input, ready.mirror);
 			if (refused !== undefined) return { block: true, reason: refused };
 		}
 		return undefined;
@@ -244,7 +244,7 @@ function fileShadow(name: FileToolName, native: NativeFileTool, allowed: boolean
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const ready = usable();
 			if (typeof ready === "string") throw new Error(ready);
-			const refused = refuseFileCall(native, name, params, ready.mirror.hostRoot);
+			const refused = refuseFileCall(native, name, params, ready.mirror);
 			if (refused !== undefined) throw new Error(refused);
 			if (ctx.invokeTool === undefined) throw new Error(`omp-sandbox: omp's native ${name} is not available to delegate to`);
 			// Picks up what background bash jobs changed since the last sync.
