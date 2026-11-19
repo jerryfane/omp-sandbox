@@ -244,11 +244,12 @@ function fileShadow(name: FileToolName, native: NativeFileTool, allowed: boolean
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const ready = usable();
 			if (typeof ready === "string") throw new Error(ready);
-			const refused = refuseFileCall(native, name, params, ready.mirror.hostRoot);
-			if (refused !== undefined) throw new Error(refused);
 			if (ctx.invokeTool === undefined) throw new Error(`omp-sandbox: omp's native ${name} is not available to delegate to`);
 			// Picks up what background bash jobs changed since the last sync.
 			await ready.mirror.pullRemote();
+			// Checked again right before the tool runs, after the pull.
+			const refused = refuseFileCall(native, name, params, ready.mirror.hostRoot);
+			if (refused !== undefined) throw new Error(refused);
 			const result = await ctx.invokeTool(params, { signal, onUpdate });
 			try {
 				await ready.mirror.pushLocal();
