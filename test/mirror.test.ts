@@ -370,3 +370,53 @@ describe("Mirror", () => {
 		// 600 files on a shared host: well past bun's 5 s default under load.
 	}, 60_000);
 });
+
+describe("Mirror and build output", () => {
+	test("node_modules, target and .cache at any depth never reach the copy, and the sandbox keeps them", async () => {
+		await put(sandbox, "src/a.ts", "a");
+		await put(sandbox, "node_modules/dep/index.js", "dep");
+		await put(sandbox, "pkg/node_modules/inner/x.js", "x");
+		await put(sandbox, "crate/target/debug/app", "bin");
+		await put(sandbox, ".cache/blob", "c");
+		// Only a directory name counts: a similar file or directory name is mirrored.
+		await put(sandbox, "targets/t.txt", "t");
+		await put(sandbox, "docs/node_modules.md", "n");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual(["crate/", "docs/", "docs/node_modules.md=n", "pkg/", "src/", "src/a.ts=a", "targets/", "targets/t.txt=t"]);
+
+		// Build output changing in the sandbox never reaches the copy.
+		await tick();
+		await put(sandbox, "node_modules/dep/index.js", "dep v2");
+		await put(sandbox, "crate/target/release/app", "bin2");
+		await mirror.pullRemote();
+		expect(await tree(host)).toEqual(["crate/", "docs/", "docs/node_modules.md=n", "pkg/", "src/", "src/a.ts=a", "targets/", "targets/t.txt=t"]);
+
+		// A host edit is sent, and the sandbox's build output is left alone.
+		await put(host, "src/a.ts", "a2");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(sandbox, "src/a.ts"), "utf8")).toBe("a2");
+		expect(await fs.readFile(path.join(sandbox, "node_modules/dep/index.js"), "utf8")).toBe("dep v2");
+		expect(await fs.readFile(path.join(sandbox, "crate/target/release/app"), "utf8")).toBe("bin2");
+		expect(await fs.readFile(path.join(sandbox, ".cache/blob"), "utf8")).toBe("c");
+
+		// Build output deleted in the sandbox is no conflict: the copy never had it.
+		await fs.rm(path.join(sandbox, "node_modules"), { recursive: true });
+		await put(host, "src/a.ts", "a3");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(sandbox, "src/a.ts"), "utf8")).toBe("a3");
+	}, 60_000);
+
+	test("build output made on the host is not sent, and the sandbox's is not deleted because the host lacks it", async () => {
+		await put(sandbox, "node_modules/dep/index.js", "sandbox dep");
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		await put(host, "node_modules/dep/index.js", "host-made");
+		await put(host, "target/out", "host build");
+		await put(host, "src/b.ts", "b");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(sandbox, "node_modules/dep/index.js"), "utf8")).toBe("sandbox dep");
+		expect(await Bun.file(path.join(sandbox, "target")).exists()).toBe(false);
+		expect(await fs.readFile(path.join(sandbox, "src/b.ts"), "utf8")).toBe("b");
+	}, 60_000);
+});

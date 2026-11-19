@@ -437,6 +437,32 @@ export default function (pi) {
 		expect(await fs.readFile(secret, "utf8")).toBe("HOST-ONLY-SECRET");
 	}, 180_000);
 
+	test("build output stays in the sandbox, and file tools on it are refused, also as a search root or list member", async () => {
+		const call = (name: string, args: Record<string, unknown>) => ({ name, arguments: args });
+		const run = await runOmp([
+			bash({ command: "mkdir -p node_modules/dep && echo needle > node_modules/dep/index.js && echo needle > app.ts" }),
+			call("read", { path: "node_modules/dep/index.js" }),
+			call("write", { path: "node_modules/dep/planted.js", content: "x" }),
+			call("grep", { pattern: "needle", path: "node_modules" }),
+			call("glob", { path: "node_modules/**" }),
+			call("read", { path: "app.ts;node_modules/dep/index.js" }),
+			call("grep", { pattern: "needle", path: "." }),
+		]);
+		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
+		expect(byId.get("call_0")?.isError).toBe(false);
+		for (const id of ["call_1", "call_2", "call_3", "call_4", "call_5"]) {
+			expect(byId.get(id)?.isError).toBe(true);
+			expect(byId.get(id)?.text).toContain("build output (node_modules, target, .cache)");
+		}
+		// A search of the copy finds the project's own file, not the build output.
+		expect(byId.get("call_6")?.isError).toBe(false);
+		expect(byId.get("call_6")?.text).toContain("app.ts");
+		expect(byId.get("call_6")?.text).not.toContain("node_modules");
+		expect(await Bun.file(path.join(run.hostDir, "node_modules")).exists()).toBe(false);
+		expect(await fs.readFile(path.join(run.sandboxDir, "node_modules/dep/index.js"), "utf8")).toBe("needle\n");
+		expect(await Bun.file(path.join(run.sandboxDir, "node_modules/dep/planted.js")).exists()).toBe(false);
+	}, 120_000);
+
 	test("an interactive approval prompt shows the command the agent wrote, as for native bash, and its answer is followed", async () => {
 		// RPC mode with always-ask: each bash call raises omp's approval prompt.
 		const agentDir = path.join(scratch, "agent-always-ask");

@@ -12,6 +12,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { FileToolSession, NativeFileTool } from "@oh-my-pi/pi-coding-agent";
+import { notMirrored } from "./mirror.ts";
 
 /**
  * The file tools that run on the host copy, one entry each: the only list.
@@ -164,8 +165,9 @@ function refusePath(file: string, root: string): string | undefined {
 	if (!isInside(root, file)) {
 		return `omp-sandbox: ${file} is outside the sandboxed workspace ${root}; only paths inside it exist in the sandbox`;
 	}
-	if (path.relative(root, path.resolve(file)).split(path.sep).some(part => part.toLowerCase() === ".git")) {
-		return `omp-sandbox: ${file} is inside a .git directory, which is not copied from the sandbox; use git through bash instead`;
+	const rel = path.relative(root, path.resolve(file)).split(path.sep).join("/");
+	if (rel !== "" && notMirrored(rel)) {
+		return `omp-sandbox: ${file} is inside a .git directory or build output (node_modules, target, .cache), which is not copied from the sandbox; use bash there`;
 	}
 	return undefined;
 }
