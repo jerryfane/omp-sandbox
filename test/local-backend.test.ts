@@ -295,11 +295,10 @@ async function listRecursiveUnprivileged(root: string): Promise<unknown> {
 	let cwd = scratch;
 	if (process.getuid?.() === 0) {
 		const code = path.join(scratch, "code");
-		await fs.mkdir(path.join(code, "src"), { recursive: true });
+		// All of src, so an import added to local-backend.ts never breaks the fixture.
+		await fs.cp(path.join(import.meta.dir, "../src"), path.join(code, "src"), { recursive: true });
 		await fs.mkdir(path.join(code, "test/fixtures"), { recursive: true });
-		for (const file of ["src/backend.ts", "src/local-backend.ts", "test/fixtures/list-recursive.ts"]) {
-			await fs.copyFile(path.join(import.meta.dir, "..", file), path.join(code, file));
-		}
+		await fs.copyFile(path.join(import.meta.dir, "fixtures/list-recursive.ts"), path.join(code, "test/fixtures/list-recursive.ts"));
 		await fs.chmod(scratch, 0o755);
 		expect(Bun.spawnSync(["chown", "-R", "65534:65534", code, root]).exitCode).toBe(0);
 		argv = ["setpriv", "--reuid=65534", "--regid=65534", "--clear-groups", "--", process.execPath, path.join(code, "test/fixtures/list-recursive.ts"), root];

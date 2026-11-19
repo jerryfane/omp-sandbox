@@ -95,8 +95,16 @@ Every path a backend takes is an absolute path *inside the sandbox*. Translating
   - **Otherwise `"process-tree"`:** the kill freezes the descendant tree with `SIGSTOP` round by round, then kills it.
 - **Errors:** a directory a recursive `list` cannot open fails the whole call with `EACCES` (or its own code), so a listing is never silently incomplete.
 
+### `GitmootBackend` ([`src/gitmoot-backend.ts`](src/gitmoot-backend.ts))
+The sandbox is a gitmoot remote workspace (gitmoot/gitmoot#2678): a VM bound to one seat and one issue or PR. The add-on talks only to the `gitmoot` CLI; the CLI holds the provider credentials and enforces the pilot's cost cap. The contract is gitmoot's `skills/gitmoot/references/WORKSPACES.md`.
+- **`open`** reads the workspace's root and state from `gitmoot workspace show <id> --json` and refuses a workspace that is not `ready`.
+- **`shellCommand`** (for omp's bash) is `gitmoot ws sh --cwd REL '<cmd>'` by absolute path, with `GITMOOT_WORKSPACE` set. Extra variables are exported inside the remote shell; the VM never gets the host's environment.
+- **`exec`** runs `gitmoot workspace exec <id> --cwd REL --env K=V… --status-file F -- /bin/bash -c <cmd>`. Its result comes from the status file. Timeout and abort send SIGTERM to the CLI, which forwards it to the command's whole process group (SIGKILL 3 s later). A gitmoot failure (exit 125, `error` in the status file) rejects with `GitmootCliError`.
+- **Containment `"full"`:** if the CLI process dies outright, gitmoot's VM-side watchdog kills the command's group within 15 s.
+- **Not yet:** `readFile`/`writeFile`/`stat`/`list` and the sync methods (`changes`, `pull`, `push`, `remove`) need gitmoot's slice 2 commands. Until then the add-on cannot use this backend (`OMP_SANDBOX_BACKEND=gitmoot` is not wired).
+- **Tests:** `test/gitmoot-backend.test.ts` runs against a stand-in CLI that follows WORKSPACES.md. `test/gitmoot-real.test.ts` runs against a real gitmoot build with its zero-cost `provider = "local"` in a throwaway home: `GITMOOT_WS_BIN=/abs/path/to/gitmoot bun test test/gitmoot-real.test.ts`. It is skipped without that variable.
+
 ### Planned
-- `gitmoot workspace` (the first real backend), built against the CLI agreed on #2678.
 - ssh and docker, later.
 
 ## Development
@@ -112,9 +120,9 @@ One PR per step, each independently reviewed at its exact head before merge.
 
 1. Backend interface plus `LocalBackend`. *(done, #1 and #2)*
 2. **2a:** the `bash` replacement. *(done, #3)*
-   **2b:** the file tools, on a host copy kept in sync with the sandbox, so omp's own tools and their snapshot tags keep working; `eval`, `debug`, `lsp`, `task` and `ast_edit` refused. *(this PR)*
-3. A prototype in a throwaway omp agent dir, driven by a scripted provider (no model tokens). It answers whether approvals (interactive prompts) and the output minimizer still work with replaced tools, what other paths to host execution remain (`!` commands, xd:// devices, MCP, plugins), and how fast the sync is at repo size.
-4. The `gitmoot workspace` backend.
+   **2b:** the file tools, on a host copy kept in sync with the sandbox, so omp's own tools and their snapshot tags keep working; `eval`, `debug`, `lsp`, `task` and `ast_edit` refused. *(done, #5 and #6)*
+3. A prototype in a throwaway omp agent dir, driven by a scripted provider (no model tokens). It answers whether approvals (interactive prompts) and the output minimizer still work with replaced tools, what other paths to host execution remain (`!` commands, xd:// devices, MCP, plugins), and how fast the sync is at repo size. *(done; answers above and on gitmoot#2678)*
+4. The `gitmoot workspace` backend. **4a:** commands (`open`, `ws sh`, `exec`) against gitmoot's slice 1. *(this PR)* **4b:** file sync against slice 2, and `OMP_SANDBOX_BACKEND=gitmoot`.
 5. ssh and docker backends. The repo goes public after the prototype passes and an independent review.
 
 ## Safety

@@ -23,19 +23,13 @@ import {
 	type SyncFile,
 	type TreeEntry,
 } from "./backend.ts";
+import { ENV_NAME, shellQuote } from "./shell.ts";
 
 /** Environment every LocalBackend command starts from. Nothing comes from the host. */
 const BASE_ENV: Readonly<Record<string, string>> = {
 	PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	LANG: "C.UTF-8",
 };
-
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/** Quote `text` as one POSIX shell word. */
-function shellQuote(text: string): string {
-	return `'${text.replaceAll("'", "'\\''")}'`;
-}
 
 /**
  * In process-tree mode, how long to keep reading after the shell exits. A
