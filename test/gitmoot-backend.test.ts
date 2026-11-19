@@ -193,6 +193,8 @@ describe("GitmootBackend files and sync", () => {
 		await backend.writeFile(path.join(root, "new/deep/a.txt"), "three", { mode: 0o755 });
 		expect((await fs.stat(path.join(root, "new/deep/a.txt"))).mode & 0o777).toBe(0o755);
 		expect(await backend.stat(path.join(root, "new/deep/a.txt"))).toMatchObject({ path: path.join(root, "new/deep/a.txt"), type: "file", size: 5 });
+		const statted = await backend.stat(path.join(root, "new/deep/a.txt"));
+		expect(Math.abs((statted?.mtimeMs ?? 0) - (await fs.stat(path.join(root, "new/deep/a.txt"))).mtimeMs)).toBeLessThan(2);
 		expect(await backend.stat(path.join(root, "missing"))).toBeNull();
 		await fs.symlink("/etc/passwd", path.join(root, "link"));
 		expect((await backend.stat(path.join(root, "link")))?.type).toBe("symlink");

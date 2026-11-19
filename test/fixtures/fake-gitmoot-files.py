@@ -84,7 +84,8 @@ def tree(root):
         for name in sorted(dirnames + filenames):
             rel = name if rel_dir == "." else f"{rel_dir}/{name}"
             info = os.lstat(os.path.join(dirpath, name))
-            out.append({"path": rel, "type": kind(info.st_mode), "size": info.st_size if not stat.S_ISDIR(info.st_mode) else 0, "mtime": info.st_mtime, "mode": info.st_mode & 0o7777})
+            # The raw st_mode (type bits included): WORKSPACES.md does not promise permission bits only.
+            out.append({"path": rel, "type": kind(info.st_mode), "size": info.st_size if not stat.S_ISDIR(info.st_mode) else 0, "mtime": info.st_mtime, "mode": info.st_mode})
         # os.walk does not descend into symlinked directories by default
     return sorted(out, key=lambda e: e["path"].encode())
 

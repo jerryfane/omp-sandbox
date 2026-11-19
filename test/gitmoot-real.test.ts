@@ -182,6 +182,9 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		const after = await backend.changes(base.token);
 		expect(after.full).toBe(false);
 		expect(after.changed.map(e => e.path)).toEqual(expect.arrayContaining(["sync-test/a.txt", "sync-test/new/b.txt", "sync-test/full/kept.txt"]));
+		const entry = after.changed.find(e => e.path === "sync-test/a.txt");
+		expect(entry?.mode).toBe(0o600);
+		expect(Math.abs((entry?.mtimeMs ?? 0) - (await fs.stat(path.join(backend.root, "sync-test/a.txt"))).mtimeMs)).toBeLessThan(2);
 		// The Mirror's order: deepest first. The non-empty directory stays, the rest goes.
 		await backend.remove(["sync-test/new/b.txt", "sync-test/new", "sync-test/full", "sync-test/a.txt", "sync-test/gone"]);
 		expect((await fs.readdir(path.join(backend.root, "sync-test"))).sort()).toEqual(["full"]);
