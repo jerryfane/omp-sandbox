@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { exists } from "./fixtures/exists.ts";
 import { GitmootBackend, GitmootCliError } from "../src/gitmoot-backend.ts";
 import { Mirror } from "../src/mirror.ts";
 
@@ -224,7 +225,7 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		expect(await fs.readFile(path.join(backend.root, "mirror-new/n.txt"), "utf8")).toBe("n");
 		await fs.rm(path.join(host, "mirror-new"), { recursive: true });
 		await mirror.pushLocal();
-		expect(await Bun.file(path.join(backend.root, "mirror-new")).exists()).toBe(false);
+		expect(await exists(path.join(backend.root, "mirror-new"))).toBe(false);
 		await fs.writeFile(path.join(backend.root, "README.md"), "widget, edited in the sandbox\n");
 		await mirror.pullRemote();
 		expect(await fs.readFile(path.join(host, "README.md"), "utf8")).toBe("widget, edited in the sandbox\n");
@@ -250,8 +251,24 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		await mirror.pushLocal();
 		expect(await fs.readFile(path.join(backend.root, "nested/file.txt"), "utf8")).toBe("f2");
 		expect(await Bun.file(path.join(backend.root, "nested/.git/config")).exists()).toBe(false);
-		expect(await Bun.file(path.join(backend.root, "nested/.GIT")).exists()).toBe(false);
+		expect(await exists(path.join(backend.root, "nested/.GIT"))).toBe(false);
 		expect(await fs.readFile(path.join(backend.root, "nested/.git/HEAD"), "utf8")).toBe("ref: refs/heads/main\n");
+	}, 120_000);
+
+	test("real CLI: build output in the workspace stays out of the Mirror's copy and is left alone in the workspace", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		await backend.exec("mkdir -p node_modules/dep sub/target && echo dep > node_modules/dep/index.js && echo bin > sub/target/app && echo app > build-app.ts", { cwd: backend.root });
+		const host = await fs.mkdtemp(path.join(scratch, "mirror-build-"));
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		expect(await fs.readFile(path.join(host, "build-app.ts"), "utf8")).toBe("app\n");
+		expect(await exists(path.join(host, "node_modules"))).toBe(false);
+		expect(await exists(path.join(host, "sub/target"))).toBe(false);
+		await fs.writeFile(path.join(host, "build-app.ts"), "app2\n");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(backend.root, "build-app.ts"), "utf8")).toBe("app2\n");
+		expect(await fs.readFile(path.join(backend.root, "node_modules/dep/index.js"), "utf8")).toBe("dep\n");
+		expect(await fs.readFile(path.join(backend.root, "sub/target/app"), "utf8")).toBe("bin\n");
 	}, 120_000);
 
 	test.if(ompInstalled)("installed omp with OMP_SANDBOX_BACKEND=gitmoot: bash and the file tools act on the workspace, never the host", async () => {

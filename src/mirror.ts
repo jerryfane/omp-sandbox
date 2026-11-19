@@ -54,7 +54,8 @@ const CONFLICTS_SHOWN = 5;
  *
  * Only regular files and directories are mirrored. A sandbox symlink or
  * special file is not created here (a symlink could lead a host tool out of
- * the copy), and `.git` is not mirrored.
+ * the copy), and `.git` is not mirrored. Neither is build output: anything
+ * under a directory named in BUILD_DIRS, at any depth, stays in the sandbox.
  *
  * Conflicts are never resolved: a path changed on both sides since the last
  * sync, or a host path the mirror would have to delete or overwrite without
@@ -129,7 +130,7 @@ export class Mirror {
 	}
 
 	async #pull(): Promise<void> {
-		const changes = await this.#backend.changes(this.#token);
+		const changes = withoutBuildOutput(await this.#backend.changes(this.#token));
 		await this.#apply(await this.#remoteDelta(changes));
 		this.#token = changes.token;
 	}
@@ -150,7 +151,7 @@ export class Mirror {
 		if (local.size === 0) return;
 
 		// What the sandbox did since the last sync, checked before anything is sent.
-		const changes = await this.#backend.changes(this.#token);
+		const changes = withoutBuildOutput(await this.#backend.changes(this.#token));
 		const remote = await this.#remoteDelta(changes);
 		const conflicts = overlap(local, remote);
 		if (conflicts.length > 0) {
@@ -373,7 +374,7 @@ export class Mirror {
 		const found = new Map<string, Scanned>();
 		const walk = async (dir: string, rel: string): Promise<void> => {
 			for (const name of await fs.readdir(dir)) {
-				if (isGitName(name)) continue;
+				if (isGitName(name) || BUILD_DIRS.has(name)) continue;
 				const childRel = rel === "" ? name : `${rel}/${name}`;
 				const info = await lstatOrUndefined(path.join(dir, name));
 				if (info === undefined) continue;
@@ -456,6 +457,26 @@ function relativeParts(rel: string): string[] {
 /** `.git` in any letter case: gitmoot never lists, pulls, pushes or removes one, at any depth. */
 function isGitName(name: string): boolean {
 	return name.toLowerCase() === ".git";
+}
+
+/**
+ * Build-output directory names kept in the sandbox, at any depth: installs
+ * and builds there must not fill the host's disk. A name rule, like `.git`,
+ * so the answer never changes while omp runs: a tracked directory with one
+ * of these names is not mirrored either (file tools refuse it; bash reaches
+ * it in the sandbox).
+ */
+const BUILD_DIRS: ReadonlySet<string> = new Set(["node_modules", "target", ".cache"]);
+
+/** Whether a workspace-relative path is, or is under, a directory the mirror never copies (`.git` or build output). */
+export function notMirrored(rel: string): boolean {
+	return rel.split("/").some(part => isGitName(part) || BUILD_DIRS.has(part));
+}
+
+/** `changes` without build output: the sandbox lists it, the copy never holds it. */
+function withoutBuildOutput(changes: Changes): Changes {
+	const keep = (rel: string) => !rel.split("/").some(part => BUILD_DIRS.has(part));
+	return { ...changes, changed: changes.changed.filter(entry => keep(entry.path)), deleted: changes.deleted.filter(keep) };
 }
 
 function fileFingerprint(info: Stats): string {
