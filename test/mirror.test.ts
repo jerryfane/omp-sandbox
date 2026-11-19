@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { exists } from "./fixtures/exists.ts";
 import type { Backend, Changes } from "../src/backend.ts";
 import { LocalBackend } from "../src/local-backend.ts";
 import { Mirror, MirrorError } from "../src/mirror.ts";
@@ -416,7 +417,7 @@ describe("Mirror and build output", () => {
 		await put(host, "src/b.ts", "b");
 		await mirror.pushLocal();
 		expect(await fs.readFile(path.join(sandbox, "node_modules/dep/index.js"), "utf8")).toBe("sandbox dep");
-		expect(await Bun.file(path.join(sandbox, "target")).exists()).toBe(false);
+		expect(await exists(path.join(sandbox, "target"))).toBe(false);
 		expect(await fs.readFile(path.join(sandbox, "src/b.ts"), "utf8")).toBe("b");
 	}, 60_000);
 });

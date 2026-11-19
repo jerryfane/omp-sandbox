@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { exists } from "./fixtures/exists.ts";
 import { GitmootBackend, GitmootCliError } from "../src/gitmoot-backend.ts";
 import { Mirror } from "../src/mirror.ts";
 
@@ -224,7 +225,7 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		expect(await fs.readFile(path.join(backend.root, "mirror-new/n.txt"), "utf8")).toBe("n");
 		await fs.rm(path.join(host, "mirror-new"), { recursive: true });
 		await mirror.pushLocal();
-		expect(await Bun.file(path.join(backend.root, "mirror-new")).exists()).toBe(false);
+		expect(await exists(path.join(backend.root, "mirror-new"))).toBe(false);
 		await fs.writeFile(path.join(backend.root, "README.md"), "widget, edited in the sandbox\n");
 		await mirror.pullRemote();
 		expect(await fs.readFile(path.join(host, "README.md"), "utf8")).toBe("widget, edited in the sandbox\n");
@@ -250,7 +251,7 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		await mirror.pushLocal();
 		expect(await fs.readFile(path.join(backend.root, "nested/file.txt"), "utf8")).toBe("f2");
 		expect(await Bun.file(path.join(backend.root, "nested/.git/config")).exists()).toBe(false);
-		expect(await Bun.file(path.join(backend.root, "nested/.GIT")).exists()).toBe(false);
+		expect(await exists(path.join(backend.root, "nested/.GIT"))).toBe(false);
 		expect(await fs.readFile(path.join(backend.root, "nested/.git/HEAD"), "utf8")).toBe("ref: refs/heads/main\n");
 	}, 120_000);
 
@@ -261,8 +262,8 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		const mirror = await Mirror.create(backend, host);
 		await mirror.pullRemote();
 		expect(await fs.readFile(path.join(host, "build-app.ts"), "utf8")).toBe("app\n");
-		expect(await Bun.file(path.join(host, "node_modules")).exists()).toBe(false);
-		expect(await Bun.file(path.join(host, "sub/target")).exists()).toBe(false);
+		expect(await exists(path.join(host, "node_modules"))).toBe(false);
+		expect(await exists(path.join(host, "sub/target"))).toBe(false);
 		await fs.writeFile(path.join(host, "build-app.ts"), "app2\n");
 		await mirror.pushLocal();
 		expect(await fs.readFile(path.join(backend.root, "build-app.ts"), "utf8")).toBe("app2\n");

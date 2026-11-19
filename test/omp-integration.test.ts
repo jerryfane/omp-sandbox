@@ -7,6 +7,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { exists } from "./fixtures/exists.ts";
 
 const OMP = process.env.OMP_BIN || Bun.which("omp") || "";
 const ompInstalled = OMP !== "" && (await Bun.file(OMP).exists());
@@ -458,7 +459,7 @@ export default function (pi) {
 		expect(byId.get("call_6")?.isError).toBe(false);
 		expect(byId.get("call_6")?.text).toContain("app.ts");
 		expect(byId.get("call_6")?.text).not.toContain("node_modules");
-		expect(await Bun.file(path.join(run.hostDir, "node_modules")).exists()).toBe(false);
+		expect(await exists(path.join(run.hostDir, "node_modules"))).toBe(false);
 		expect(await fs.readFile(path.join(run.sandboxDir, "node_modules/dep/index.js"), "utf8")).toBe("needle\n");
 		expect(await Bun.file(path.join(run.sandboxDir, "node_modules/dep/planted.js")).exists()).toBe(false);
 	}, 120_000);
