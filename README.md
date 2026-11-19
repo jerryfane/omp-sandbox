@@ -125,7 +125,7 @@ The sandbox is a gitmoot remote workspace (gitmoot/gitmoot#2678): a VM bound to 
 bun install
 bun test          # unit tests (Linux; they use /proc) and, when omp is on PATH (or OMP_BIN names it),
                   # integration tests that run it with a scripted provider (no model, no spend)
-bunx tsc --noEmit # typecheck
+bun x tsc --noEmit # typecheck (same as bunx; works where only the bun binary is installed)
 GITMOOT_WS_BIN=/abs/path/to/gitmoot bun test test/gitmoot-real.test.ts   # against a real gitmoot build
 ```
 
