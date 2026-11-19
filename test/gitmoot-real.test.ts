@@ -12,8 +12,8 @@ import { Mirror } from "../src/mirror.ts";
 
 const BIN = process.env.GITMOOT_WS_BIN ?? "";
 const available = BIN !== "" && (await Bun.file(BIN).exists());
-const OMP = process.env.OMP_BIN ?? "/root/.local/bin/omp";
-const ompInstalled = await Bun.file(OMP).exists();
+const OMP = process.env.OMP_BIN || Bun.which("omp") || "";
+const ompInstalled = OMP !== "" && (await Bun.file(OMP).exists());
 
 let scratch: string;
 let home: string;
