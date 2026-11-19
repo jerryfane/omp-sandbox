@@ -202,30 +202,32 @@ export class Mirror {
 	}
 
 	/**
-	 * What really changed in the sandbox since the last sync. Every file
-	 * `changes` reports (or, for a full listing, every file listed) is pulled
-	 * and compared by content and mode with the last sync: an edit that kept
-	 * size and mtime is still found, and a file reported only because of its
-	 * metadata, or the echo of a push, is not a change. Directories count when
-	 * new or replacing a file; symlinks and special files always do. A full
-	 * listing's deletes are what the last sync held and it no longer lists.
+	 * What really changed in the sandbox since the last sync, as paths. A
+	 * reported file the last sync already held is pulled and compared by
+	 * content and mode: an edit that kept size and mtime is still found, and a
+	 * file reported only because of its metadata, or the echo of a push, is
+	 * not a change. A file the mirror does not hold is a change without being
+	 * pulled. Contents are hashed one batch at a time and not kept, so memory
+	 * stays bounded by BATCH; #apply pulls the changed files again to write
+	 * them. Directories count when new or replacing a file; symlinks and
+	 * special files always do. A full listing's deletes are what the last sync
+	 * held and it no longer lists.
 	 */
 	async #remoteDelta(changes: Changes): Promise<RemoteDelta> {
 		const others: TreeEntry[] = [];
-		const candidates: string[] = [];
+		const files: string[] = [];
+		const toCompare: string[] = [];
 		for (const entry of changes.changed) {
-			if (entry.type === "file") candidates.push(entry.path);
+			if (entry.type === "file") (this.#known.get(entry.path)?.type === "file" ? toCompare : files).push(entry.path);
 			else if (entry.type !== "dir" || this.#known.get(entry.path)?.type !== "dir") others.push(entry);
 		}
-		const files: SyncFile[] = [];
-		for (let start = 0; start < candidates.length; start += BATCH) {
+		for (let start = 0; start < toCompare.length; start += BATCH) {
 			// A file gone by the time it is pulled is left out; the next `changes` reports it.
-			for (const file of await this.#backend.pull(candidates.slice(start, start + BATCH))) {
-				const known = this.#known.get(file.path);
-				if (known?.type === "file" && known.content === contentKey(file)) continue;
-				files.push(file);
+			for (const file of await this.#backend.pull(toCompare.slice(start, start + BATCH))) {
+				if (this.#known.get(file.path)?.content !== contentKey(file)) files.push(file.path);
 			}
 		}
+		files.sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
 		let deleted = changes.deleted;
 		if (changes.full) {
 			const listed = new Set(changes.changed.map(entry => entry.path));
@@ -243,7 +245,10 @@ export class Mirror {
 			// A symlink or special file: not mirrored. A file the mirror held there goes.
 			else await this.#removeHost(entry.path, `a ${entry.type} in the sandbox now`);
 		}
-		for (const file of delta.files) await this.#writeHost(file);
+		for (let start = 0; start < delta.files.length; start += BATCH) {
+			// One batch of contents at a time; a file gone since #remoteDelta is left out.
+			for (const file of await this.#backend.pull(delta.files.slice(start, start + BATCH))) await this.#writeHost(file);
+		}
 	}
 
 	/**
@@ -401,8 +406,8 @@ export class Mirror {
 interface RemoteDelta {
 	/** Directories, symlinks and special files that are new or changed type. */
 	others: TreeEntry[];
-	/** Files whose content or mode differs from the last sync, already pulled. */
-	files: SyncFile[];
+	/** Files whose content or mode differs from the last sync, or that the mirror does not hold. */
+	files: string[];
 	deleted: string[];
 }
 
@@ -414,7 +419,7 @@ interface RemoteDelta {
 function overlap(local: ReadonlyMap<string, Kind>, remote: RemoteDelta): string[] {
 	const remoteKinds = new Map<string, Kind>();
 	for (const entry of remote.others) remoteKinds.set(entry.path, "changed");
-	for (const file of remote.files) remoteKinds.set(file.path, "changed");
+	for (const rel of remote.files) remoteKinds.set(rel, "changed");
 	for (const rel of remote.deleted) remoteKinds.set(rel, "deleted");
 	const clash = (a: Kind, b: Kind) => !(a === "deleted" && b === "deleted");
 	const found = new Set<string>();
