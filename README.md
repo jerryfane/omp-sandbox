@@ -140,3 +140,14 @@ One PR per step, each independently reviewed at its exact head before merge.
 
 ## Safety
 **Never install this into `~/.omp/agent/extensions`.** Every omp session for that user loads that directory. Load it explicitly instead, with `omp --extension <path>` or `--trusted-extension <abs-path>`.
+
+## Security
+
+**Fixed in #18 (`5c58d685`): host files readable through `read` path lists.**
+- **Affected:** `main` before `5c58d685`.
+- **Exposure:** read-only. A `read` call could return the contents of a host file outside the sandboxed copy, by naming it inside a path list or an encoded path. No file could be written outside the copy.
+- **Cause:** omp's `read` splits and decodes some path strings at execution, while the add-on checked only the path as a whole.
+- **Fix:** every file tool now takes one plain path per call. Paths containing list separators, braces, backslashes, `%`-escapes or `file://` are refused, and each remaining path must lie inside the copy.
+- **Action:** if you ran an earlier version, update to `main` at or after `5c58d685`.
+
+Please do not open a public issue for a security problem; contact the repository owner first.
