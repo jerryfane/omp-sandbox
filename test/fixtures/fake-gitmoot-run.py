@@ -13,7 +13,7 @@ import json
 import os
 import signal
 import sys
-import threading
+import time
 
 status_file, argv = sys.argv[1], sys.argv[2:]
 pid = os.fork()
@@ -23,19 +23,26 @@ if pid == 0:
     os.execvp(argv[0], argv)
 
 
+# When a signal was forwarded: the moment the group gets SIGKILL if anything in it is still alive.
+escalate_at = None
+
+
 def forward(signum, _frame):
+    global escalate_at
     try:
         os.killpg(pid, signum)
     except ProcessLookupError:
         return
+    if escalate_at is None:
+        escalate_at = time.monotonic() + 3.0
 
-    def kill_later():
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
 
-    threading.Timer(3.0, kill_later).start()
+def group_alive():
+    try:
+        os.killpg(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
 
 
 signal.signal(signal.SIGTERM, forward)
@@ -50,6 +57,16 @@ if os.WIFSIGNALED(wait_status):
     exit_code, sig = None, os.WTERMSIG(wait_status)
 else:
     exit_code, sig = os.WEXITSTATUS(wait_status), None
+# The leader is reaped, but a member that ignored the forwarded signal may remain: the
+# promised SIGKILL still reaches it, before the runner reports and exits.
+if escalate_at is not None:
+    while group_alive() and time.monotonic() < escalate_at:
+        time.sleep(0.05)
+    if group_alive():
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 if status_file != "-":
     with open(status_file + ".tmp", "w") as f:
         json.dump({"exit_code": exit_code, "signal": sig, "timed_out": False, "error": None}, f)

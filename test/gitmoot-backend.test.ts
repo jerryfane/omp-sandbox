@@ -165,6 +165,35 @@ describe("GitmootBackend", () => {
 		}
 	});
 
+	test("a group member that ignores SIGTERM is still killed about 3 s after a cancel", async () => {
+		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
+		const pidFile = path.join(root, "stubborn.pid");
+		// Cancel only once the member has set its trap and written its pid: a fixed
+		// timeout can fire first on a loaded host.
+		const controller = new AbortController();
+		const pending = backend.exec(`bash -c 'trap "" TERM; echo $$ > ${pidFile}.tmp; mv ${pidFile}.tmp ${pidFile}; while :; do sleep 0.1; done' & sleep 30`, {
+			cwd: root,
+			signal: controller.signal,
+		});
+		while (!(await Bun.file(pidFile).exists())) await Bun.sleep(20);
+		controller.abort();
+		const result = await pending;
+		expect(result.aborted).toBe(true);
+		const pid = Number.parseInt(await fs.readFile(pidFile, "utf8"), 10);
+		const alive = () => {
+			try {
+				process.kill(pid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		// The CLI reports only after the escalation, as the real one does: the member is gone by now.
+		const survived = alive();
+		if (survived) process.kill(pid, "SIGKILL");
+		expect(survived).toBe(false);
+	}, 20_000);
+
 	test("exec stops capturing at maxOutputBytes, and a gitmoot failure rejects with its code", async () => {
 		const backend = await GitmootBackend.open({ bin: FAKE, workspace: "ws-test" });
 		const big = await backend.exec("head -c 5000 /dev/zero | tr '\\0' x", { cwd: root, maxOutputBytes: 100 });
