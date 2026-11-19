@@ -143,30 +143,47 @@ const TOKEN_SPLIT = /[;,\s\u200b{}]+/u;
 const MAX_EXPANSIONS = 1024;
 
 /**
- * Every path-like token in the raw `path` and `paths` arguments: brace
- * alternatives expanded with their prefix and suffix (`{src,test}/x` is
- * `src/x` and `test/x`), then split on every separator, also after
- * percent-decoding and removing `file://` prefixes. Prefixes omp strips (`@`,
- * a stray `:`, quotes) are removed. URLs other than file:// and `!glob`
- * exclusions are left out. Undefined when an argument expands past
- * MAX_EXPANSIONS.
+ * Every path-like token in the raw `path` and `paths` arguments, under every
+ * reading a tool may apply, so a separator any tool honours is seen in at
+ * least one of them:
+ * - the plain split on every separator and brace, braces given no meaning
+ *   (as `read` treats a list, and for any escaped or unbalanced brace);
+ * - the same split after expanding brace groups with their prefix and suffix
+ *   (`{src,test}/x` is `src/x` and `test/x`), as globs read them;
+ * each also after percent-decoding and removing `file://` prefixes, and each
+ * piece also with its backslashes removed. Prefixes omp strips (`@`, a stray
+ * `:`, quotes) are removed. URLs other than file:// and `!glob` exclusions
+ * are left out. A piece only the brace reading produces is checked only when
+ * it starts a path from scratch, so the expanded glob `{src,test}/**` does
+ * not make its unexpanded suffix `/**` count. Undefined when an argument
+ * expands past MAX_EXPANSIONS.
  */
 function rawPathTokens(args: unknown): string[] | undefined {
 	if (args === null || typeof args !== "object") return [];
 	const fields = args as { path?: unknown; paths?: unknown };
 	const values = [fields.path, ...(Array.isArray(fields.paths) ? fields.paths : [fields.paths])].filter((value): value is string => typeof value === "string" && value !== "");
 	const tokens = new Set<string>();
+	const add = (piece: string) => {
+		for (const form of new Set([piece, piece.replaceAll("\\", "")])) {
+			const token = form.replace(/^["'`]+|["'`]+$/g, "").replace(/^@/, "").replace(/^:(?=[/\\~.])/, "");
+			if (token === "" || token.startsWith("!") || /^[a-z][a-z0-9+.-]*:\/\//i.test(token)) continue;
+			tokens.add(token);
+		}
+	};
 	for (const value of values) {
 		const variants = new Set([value, decodeLoosely(value)]);
 		for (const variant of [...variants]) variants.add(variant.replace(/file:\/\/(localhost)?/gi, ""));
 		for (const variant of variants) {
+			const plain = variant.split(TOKEN_SPLIT);
 			const expanded = expandBraces(variant);
 			if (expanded === undefined) return undefined;
-			for (const piece of expanded.flatMap(text => text.split(TOKEN_SPLIT))) {
-				const token = piece.replace(/^["'`]+|["'`]+$/g, "").replace(/^@/, "").replace(/^:(?=[/\\~.])/, "");
-				if (token === "" || token.startsWith("!") || /^[a-z][a-z0-9+.-]*:\/\//i.test(token)) continue;
-				tokens.add(token);
-			}
+			const braced = expanded.flatMap(text => text.split(TOKEN_SPLIT));
+			// The plain reading is checked whole, except the glob suffix a balanced
+			// brace group leaves behind (`/**/*.ts` in `{src,test}/**/*.ts`): the
+			// brace reading checks that suffix with its real prefixes.
+			const suffixes = new Set(expanded.length > 1 ? plain.filter((_, index) => index > 0 && variant.includes(`}${plain[index]}`)) : []);
+			for (const piece of plain) if (!suffixes.has(piece)) add(piece);
+			for (const piece of braced) add(piece);
 		}
 	}
 	return [...tokens];

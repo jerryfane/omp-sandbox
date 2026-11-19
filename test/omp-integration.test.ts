@@ -403,6 +403,8 @@ export default function (pi) {
 			// A file:// URL whose list separator is percent-encoded.
 			`file://${hostDir}/a.txt%3B${secret}`,
 			`file://${hostDir}/a.txt%2C${secret}`,
+			// A backslash-escaped brace: read gives it no meaning, so its commas separate.
+			`a\\{b,${secret},c}`,
 		];
 		const run = await runOmp(
 			[...leaking.map(p => call("read", { path: p })), call("read", { path: "a.txt;sub/b.txt" }), call("glob", { path: "{sub,other}/*.txt" })],
