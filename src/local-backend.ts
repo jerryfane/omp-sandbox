@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { constants, readdirSync, readFileSync, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
@@ -9,6 +10,7 @@ import {
 	type Backend,
 	BackendError,
 	type BackendErrorCode,
+	type Changes,
 	DEFAULT_MAX_OUTPUT_BYTES,
 	type ExecOptions,
 	type ExecResult,
@@ -18,6 +20,8 @@ import {
 	type ListResult,
 	type OutputStream,
 	type ShellCommandOptions,
+	type SyncFile,
+	type TreeEntry,
 } from "./backend.ts";
 
 /** Environment every LocalBackend command starts from. Nothing comes from the host. */
@@ -43,6 +47,10 @@ const EXIT_DRAIN_MS = 250;
 const O_DIR = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
 const O_READ = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const O_WRITE = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const O_CREATE_NEW = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
+
+/** How many `changes` tokens LocalBackend remembers; an older one gets a full listing. */
+const MAX_TOKENS = 8;
 
 /**
  * The pid-namespace "init" (PID 1), a small Python program. It runs the
@@ -152,6 +160,8 @@ export class LocalBackend implements Backend {
 	readonly root: string;
 	readonly containment: "full" | "process-tree";
 	readonly #rootDir: FileHandle;
+	/** Tree fingerprints by `changes` token, oldest first. */
+	readonly #manifests = new Map<string, Map<string, string>>();
 
 	private constructor(root: string, rootDir: FileHandle, containment: "full" | "process-tree") {
 		this.root = root;
@@ -428,6 +438,168 @@ export class LocalBackend implements Backend {
 		return entries.length > limit ? { entries: entries.slice(0, limit), truncated: true } : { entries, truncated: false };
 	}
 
+	async changes(since?: string): Promise<Changes> {
+		const entries = new Map<string, { entry: TreeEntry; fingerprint: string }>();
+		const walk = async (dirFd: number, rel: string): Promise<void> => {
+			let names: string[];
+			try {
+				names = await fs.readdir(at(dirFd, "."));
+			} catch (error) {
+				throw mapFsError(error, path.posix.join(this.root, rel));
+			}
+			for (const name of names) {
+				if (rel === "" && name === ".git") continue;
+				const childRel = rel === "" ? name : `${rel}/${name}`;
+				let info: Stats;
+				try {
+					info = await fs.lstat(at(dirFd, name));
+				} catch (error) {
+					if (isCode(error, "ENOENT")) continue; // removed while walking
+					throw mapFsError(error, path.posix.join(this.root, childRel));
+				}
+				const { type } = toStat(childRel, info);
+				const entry: TreeEntry = { path: childRel, type, size: info.size, mtimeMs: info.mtimeMs, mode: info.mode & 0o7777 };
+				// A directory's size and mtime move with its children; only its identity and mode matter.
+				const fingerprint =
+					type === "dir" ? `dir:${info.ino}:${entry.mode}` : `${type}:${info.size}:${info.mtimeMs}:${info.ctimeMs}:${info.ino}:${entry.mode}`;
+				entries.set(childRel, { entry, fingerprint });
+				if (type !== "dir") continue;
+				// Same rule as list: re-opened with O_NOFOLLOW, and not entered when it changed meanwhile.
+				const child = await fs.open(at(dirFd, name), O_DIR).catch((error: unknown) => {
+					if (isCode(error, "ENOENT") || isCode(error, "ENOTDIR") || isCode(error, "ELOOP")) return undefined;
+					throw mapFsError(error, path.posix.join(this.root, childRel));
+				});
+				if (child === undefined) continue;
+				try {
+					await walk(child.fd, childRel);
+				} finally {
+					await child.close();
+				}
+			}
+		};
+		const rootHandle = await this.#openDir([], this.root, false);
+		try {
+			await walk(rootHandle.fd, "");
+		} finally {
+			await rootHandle.close();
+		}
+
+		const current = new Map<string, string>();
+		for (const [rel, { fingerprint }] of entries) current.set(rel, fingerprint);
+		const previous = since === undefined ? undefined : this.#manifests.get(since);
+		const token = randomUUID();
+		this.#manifests.set(token, current);
+		for (const old of this.#manifests.keys()) {
+			if (this.#manifests.size <= MAX_TOKENS) break;
+			this.#manifests.delete(old);
+		}
+		const all = [...entries.values()];
+		const changed = (previous === undefined ? all : all.filter(({ entry, fingerprint }) => previous.get(entry.path) !== fingerprint)).map(e => e.entry);
+		const deleted = previous === undefined ? [] : [...previous.keys()].filter(rel => !current.has(rel));
+		changed.sort((a, b) => byteOrder(a.path, b.path));
+		deleted.sort(byteOrder);
+		return { token, full: previous === undefined, changed, deleted };
+	}
+
+	async pull(paths: readonly string[]): Promise<SyncFile[]> {
+		const files: SyncFile[] = [];
+		for (const rel of paths) {
+			const parts = relativeComponents(rel);
+			const file = path.posix.join(this.root, ...parts);
+			const dir = await this.#openDir(parts.slice(0, -1), file, false).catch((error: unknown) => {
+				if (isGone(error)) return undefined;
+				throw error;
+			});
+			if (dir === undefined) continue;
+			try {
+				const handle = await fs.open(at(dir.fd, parts.at(-1) as string), O_READ).catch((error: unknown) => {
+					if (isCode(error, "ENOENT") || isCode(error, "ELOOP") || isCode(error, "ENXIO")) return undefined;
+					throw mapFsError(error, file);
+				});
+				if (handle === undefined) continue;
+				try {
+					const info = await handle.stat();
+					if (!info.isFile()) continue;
+					files.push({ path: parts.join("/"), mode: info.mode & 0o7777, data: new Uint8Array(await handle.readFile()) });
+				} finally {
+					await handle.close();
+				}
+			} finally {
+				await dir.close();
+			}
+		}
+		return files;
+	}
+
+	async push(files: readonly SyncFile[]): Promise<void> {
+		for (const entry of files) {
+			const parts = relativeComponents(entry.path);
+			const name = parts.at(-1) as string;
+			const file = path.posix.join(this.root, ...parts);
+			const dir = await this.#openDir(parts.slice(0, -1), file, true);
+			try {
+				const existing = await fs.lstat(at(dir.fd, name)).catch((error: unknown) => {
+					if (isCode(error, "ENOENT")) return undefined;
+					throw mapFsError(error, file);
+				});
+				if (existing?.isSymbolicLink()) throw new BackendError("SYMLINK", file, `will not replace a symlink: ${file}`);
+				if (existing?.isDirectory()) throw new BackendError("EISDIR", file, `is a directory: ${file}`);
+				// Written next to the target and renamed over it: readers see old or new, never a mix.
+				const temp = `.omp-sandbox-push-${randomUUID()}`;
+				const handle = await fs.open(at(dir.fd, temp), O_CREATE_NEW, 0o600).catch((error: unknown) => {
+					throw mapFsError(error, file);
+				});
+				try {
+					try {
+						await handle.writeFile(entry.data);
+						await handle.chmod(entry.mode);
+					} finally {
+						await handle.close();
+					}
+					await fs.rename(at(dir.fd, temp), at(dir.fd, name));
+				} catch (error) {
+					await fs.unlink(at(dir.fd, temp)).catch(() => undefined);
+					throw mapFsError(error, file);
+				}
+			} finally {
+				await dir.close();
+			}
+		}
+	}
+
+	async remove(paths: readonly string[]): Promise<void> {
+		for (const rel of paths) {
+			const parts = relativeComponents(rel);
+			const name = parts.at(-1) as string;
+			const file = path.posix.join(this.root, ...parts);
+			const dir = await this.#openDir(parts.slice(0, -1), file, false).catch((error: unknown) => {
+				if (isGone(error)) return undefined;
+				throw error;
+			});
+			if (dir === undefined) continue;
+			try {
+				const info = await fs.lstat(at(dir.fd, name)).catch((error: unknown) => {
+					if (isCode(error, "ENOENT")) return undefined;
+					throw mapFsError(error, file);
+				});
+				if (info === undefined) continue;
+				if (info.isDirectory()) {
+					await fs.rmdir(at(dir.fd, name)).catch((error: unknown) => {
+						// Not empty: the sandbox has new content there, which stays.
+						if (isCode(error, "ENOENT") || isCode(error, "ENOTEMPTY") || isCode(error, "EEXIST")) return;
+						throw mapFsError(error, file);
+					});
+				} else {
+					await fs.unlink(at(dir.fd, name)).catch((error: unknown) => {
+						if (!isCode(error, "ENOENT")) throw mapFsError(error, file);
+					});
+				}
+			} finally {
+				await dir.close();
+			}
+		}
+	}
+
 	async close(): Promise<void> {
 		await this.#rootDir.close();
 	}
@@ -509,6 +681,24 @@ async function classifyNotDir(error: unknown, dirFd: number, name: string, file:
 function requireRegular(info: Stats, file: string): void {
 	if (info.isDirectory()) throw new BackendError("EISDIR", file, `is a directory: ${file}`);
 	if (!info.isFile()) throw new BackendError("NOT_REGULAR", file, `not a regular file: ${file}`);
+}
+
+/** A path's parent is gone, or is reached through a symlink: the path does not exist in the tree. */
+function isGone(error: unknown): boolean {
+	return error instanceof BackendError && (error.code === "ENOENT" || error.code === "ENOTDIR" || error.code === "SYMLINK");
+}
+
+/** The components of a workspace-relative path; refuses absolute, empty, `.` and `..` components. */
+function relativeComponents(rel: string): string[] {
+	const parts = rel.split("/");
+	if (rel === "" || rel.includes("\0") || parts.some(part => part === "" || part === "." || part === "..")) {
+		throw new BackendError("INVALID_PATH", rel, `workspace paths must be relative, without empty, . or .. components: ${rel}`);
+	}
+	return parts;
+}
+
+function byteOrder(a: string, b: string): number {
+	return Buffer.compare(Buffer.from(a), Buffer.from(b));
 }
 
 let pidNamespaceSupport: boolean | undefined;

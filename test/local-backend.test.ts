@@ -381,6 +381,89 @@ describe("files", () => {
 	});
 });
 
+describe("tree sync: changes, pull, push, remove", () => {
+	const bytes = (text: string) => new TextEncoder().encode(text);
+
+	test("changes lists the whole tree first, then only what changed, with exact deletes; .git is never listed", async () => {
+		await fs.writeFile(path.join(sandboxDir, "a.txt"), "a");
+		await fs.mkdir(path.join(sandboxDir, "d"));
+		await fs.writeFile(path.join(sandboxDir, "d/b.txt"), "b");
+		await fs.mkdir(path.join(sandboxDir, ".git"));
+		await fs.writeFile(path.join(sandboxDir, ".git/HEAD"), "ref");
+		await fs.symlink("/etc/passwd", path.join(sandboxDir, "link"));
+		const first = await backend.changes();
+		expect(first.full).toBe(true);
+		expect(first.changed.map(e => `${e.path}:${e.type}`)).toEqual(["a.txt:file", "d:dir", "d/b.txt:file", "link:symlink"]);
+
+		await new Promise(resolve => setTimeout(resolve, 20));
+		await fs.writeFile(path.join(sandboxDir, "a.txt"), "a2");
+		await fs.rm(path.join(sandboxDir, "d"), { recursive: true });
+		await fs.writeFile(path.join(sandboxDir, ".git/HEAD"), "moved");
+		const second = await backend.changes(first.token);
+		expect(second.full).toBe(false);
+		expect(second.changed.map(e => e.path)).toEqual(["a.txt"]);
+		expect(second.deleted).toEqual(["d", "d/b.txt"]);
+
+		const unknown = await backend.changes("not-a-token");
+		expect(unknown.full).toBe(true);
+		expect(unknown.deleted).toEqual([]);
+	});
+
+	test("push writes files with their modes and creates parents; pull reads them back; neither leaves temp files", async () => {
+		await backend.push([
+			{ path: "x/y/run.sh", mode: 0o755, data: bytes("#!/bin/sh\n") },
+			{ path: "plain.txt", mode: 0o644, data: bytes("p") },
+		]);
+		expect((await fs.stat(path.join(sandboxDir, "x/y/run.sh"))).mode & 0o777).toBe(0o755);
+		const pulled = await backend.pull(["x/y/run.sh", "plain.txt", "missing.txt", "x"]);
+		expect(pulled.map(f => [f.path, f.mode, new TextDecoder().decode(f.data)])).toEqual([
+			["x/y/run.sh", 0o755, "#!/bin/sh\n"],
+			["plain.txt", 0o644, "p"],
+		]);
+		expect((await fs.readdir(sandboxDir, { recursive: true })).sort()).toEqual(["plain.txt", "x", "x/y", "x/y/run.sh"]);
+	});
+
+	test("push refuses to replace a symlink or a directory, and never writes through a symlinked parent", async () => {
+		await fs.writeFile(path.join(hostDir, "target.txt"), "host");
+		await fs.symlink(path.join(hostDir, "target.txt"), path.join(sandboxDir, "file-link"));
+		await fs.symlink(hostDir, path.join(sandboxDir, "dir-link"));
+		await fs.mkdir(path.join(sandboxDir, "adir"));
+		await rejectsWith(backend.push([{ path: "file-link", mode: 0o644, data: bytes("x") }]), "SYMLINK");
+		await rejectsWith(backend.push([{ path: "dir-link/planted.txt", mode: 0o644, data: bytes("x") }]), "SYMLINK");
+		await rejectsWith(backend.push([{ path: "adir", mode: 0o644, data: bytes("x") }]), "EISDIR");
+		expect(await fs.readdir(hostDir)).toEqual(["target.txt"]);
+		expect(await fs.readFile(path.join(hostDir, "target.txt"), "utf8")).toBe("host");
+	});
+
+	test("pull does not follow symlinks, and remove unlinks the symlink, never its target", async () => {
+		await fs.writeFile(path.join(hostDir, "secret.txt"), "host");
+		await fs.symlink(path.join(hostDir, "secret.txt"), path.join(sandboxDir, "s"));
+		await fs.symlink(hostDir, path.join(sandboxDir, "sd"));
+		expect(await backend.pull(["s", "sd/secret.txt"])).toEqual([]);
+		await backend.remove(["s", "sd/secret.txt", "sd"]);
+		expect(await fs.readdir(sandboxDir)).toEqual([]);
+		expect(await fs.readFile(path.join(hostDir, "secret.txt"), "utf8")).toBe("host");
+	});
+
+	test("remove keeps a directory that still has content, and ignores paths already gone", async () => {
+		await fs.mkdir(path.join(sandboxDir, "full"));
+		await fs.writeFile(path.join(sandboxDir, "full/kept.txt"), "k");
+		await fs.mkdir(path.join(sandboxDir, "empty"));
+		await backend.remove(["full", "empty", "never-existed", "nope/deeper"]);
+		expect((await fs.readdir(sandboxDir, { recursive: true })).sort()).toEqual(["full", "full/kept.txt"]);
+	});
+
+	test("workspace paths with empty, . or .. components, or absolute ones, are refused", async () => {
+		for (const bad of ["", "/etc/passwd", "../x", "a/../../x", "a//b", "./a"]) {
+			await rejectsWith(backend.push([{ path: bad, mode: 0o644, data: bytes("x") }]), "INVALID_PATH");
+			await rejectsWith(backend.pull([bad]), "INVALID_PATH");
+			await rejectsWith(backend.remove([bad]), "INVALID_PATH");
+		}
+		expect(await fs.readdir(scratch)).toEqual(expect.arrayContaining(["host", "sandbox"]));
+		expect(await fs.readdir(scratch)).toHaveLength(2);
+	});
+});
+
 describe("confinement: file operations never reach the host", () => {
 	test("absolute host paths, .. escapes and relative paths are refused", async () => {
 		await fs.writeFile(path.join(hostDir, "secret"), "host data");

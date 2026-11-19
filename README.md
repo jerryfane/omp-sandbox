@@ -2,9 +2,9 @@
 
 An [omp](https://github.com/can1357/oh-my-pi) add-on that runs an agent's tools in a remote sandbox while the agent itself stays on your machine.
 
-It re-registers omp's built-in `bash`, `read`, `write`, `edit`, `grep` and `glob` tools under the same names, and forwards each call to a **backend**: the place where commands run and files live. The agent's session, pane, messages and model calls stay local. Its checkout, builds and tests run in the sandbox.
+It re-registers omp's built-in `bash` under the same name and forwards each call to a **backend**: the place where commands run and files live. omp's own file tools work on a host copy of the sandbox's files that the add-on keeps in sync. The agent's session, pane, messages and model calls stay local. Its checkout, builds and tests run in the sandbox.
 
-> **Status: prototype, private.** Steps 1 and 2a of the plan below: the backend interface, a local stand-in backend, and the `bash` replacement. The file tools still act on host files until step 2b. Do not install this for a live agent yet.
+> **Status: prototype, private.** Steps 1, 2a and 2b of the plan below: the backend interface, a local stand-in backend, the `bash` replacement and the synced file tools. Not yet checked: subagents (`task` is refused), and the sync over a real remote backend (step 3/4). Do not install this for a live agent yet.
 
 ## Why
 Design: gitmoot/gitmoot#2678, option (c). omp's built-in tools run inside the omp process, through the embedded bash engine and in-process file tools. A `shellPath` wrapper cannot move them, so the tools themselves are replaced.
@@ -16,20 +16,51 @@ Design: gitmoot/gitmoot#2678, option (c). omp's built-in tools run inside the om
 
 So omp's background jobs (`async`), auto-backgrounding, timeouts, streaming and exit-code reporting keep working unchanged. The integration test drives the installed omp to show it.
 
-- **`cwd`** is mapped from the host workspace onto the sandbox root (`PathMap`). A `cwd` outside the workspace is refused.
+- **`cwd`** is mapped from the host copy onto the sandbox root (`PathMap`). A `cwd` outside the copy is refused.
 - **Refused:** `pty` and named services (`name`/`ready`). Both would run on this machine.
-- **Approvals:** each call is judged by **omp's own bash approval rules**: `tools.approvalMode`, `tools.approval.bash`, `bash.patterns` allow/prompt/deny, the bash interceptor, and critical-command prompts. They are applied to the command the agent wrote, not the rewritten line. The delegated native call is not gated a second time. The add-on gets these rules by importing omp's `BashTool` (`@oh-my-pi/pi-coding-agent/tools/bash`), whose approval reads only settings.
-- **Fail closed:** if the add-on is configured but its backend cannot be set up, or omp's bash approval rules cannot be loaded, `bash` refuses every call instead of running on the host.
+- **Approvals:** each call is judged by **omp's own bash approval rules**: `tools.approvalMode`, `tools.approval.bash`, `bash.patterns` allow/prompt/deny, the bash interceptor, and critical-command prompts. They are applied to the command the agent wrote, not the rewritten line, and an interactive prompt shows that command (`formatApprovalDetails`), as native bash's does. The delegated native call is not gated a second time. The add-on gets these rules by importing omp's `BashTool` (`@oh-my-pi/pi-coding-agent/tools/bash`), whose approval reads only settings.
+- **Fail closed:** if the add-on is configured but its backend cannot be set up, omp's bash approval rules or file-tool parsers cannot be loaded, or the host copy is out of sync, `bash` and the file tools refuse every call instead of acting on the host.
 - **Known gap:** omp's background-job notices show the rewritten command line. A real backend keeps it short; for gitmoot it is `gitmoot ws sh …`.
 
-Configuration, in the omp process's environment:
+## How the file tools reach the sandbox
+`read`, `write`, `edit`, `grep`, `glob`, `find` and `ast_grep` run as **omp's own tools** on a **host copy** of the sandbox's workspace ([`src/mirror.ts`](src/mirror.ts)). omp's cwd is that copy. Each is re-registered as a shadow that takes its schema, description, approval, approval targets, prompt rows and documentation topics (`xd://read/…`) from an instance of omp's own tool class ([`src/file-tools.ts`](src/file-tools.ts)). That instance sees the session's current model, kept current from session events, so a model-specific contract (`edit.modelVariants`) is the same in the shadow and in the native tool it runs. The shadow runs the native tool through `ctx.invokeTool`, so `edit`'s snapshot tags and every output format are omp's. A tool omp's settings do not offer (`find` and `ast_grep` by default) is registered inactive, as it would be natively.
+
+| When | Sync |
+|---|---|
+| omp starts | the copy, which must be an empty directory, is filled from the sandbox |
+| a file tool runs | sandbox → copy, then the tool, then copy → sandbox |
+| `bash` runs | copy → sandbox, then the command, then sandbox → copy |
+
+- **Checked when each call runs.** A model can send several calls in one message, and omp prepares them all (its `tool_call` hooks) before running any. So the health check, the outside-path check and the syncs happen inside each shadow's own execution, not in a hook. All shadows are `exclusive`: omp runs them one at a time, so no two syncs or tool runs interleave. A `tool_call` hook also refuses early, before an approval prompt, but it is not relied on.
+- **Paths outside the copy are refused**, judged by each tool's own parser (its `approvalCacheTargets`, the same reading of the arguments the tool will execute and that omp's approval uses). This covers `edit`'s headers, move targets and grep's `;`-separated paths. Internal and web URLs pass through: they are not workspace files.
+- **Only files and directories are mirrored.** A symlink or special file in the sandbox is not created in the copy, and a symlink created in the copy is refused. `.git` is not mirrored in either direction. Any other name, including the mirror's own temp-file prefix, is an ordinary file.
+- **Conflicts stop the add-on; nothing is merged.**
+  - Before a push, the mirror asks the sandbox what changed since the last sync. A path changed on both sides, or one inside a directory the other side changed, is a conflict and nothing is sent. So a background job's change is never overwritten by an edit made at the same time.
+  - A pull never overwrites or deletes a host file that changed since the last sync.
+  - A pull removes a host directory only when the mirror made it (pulling, or pushing files into it), it is still that directory (same inode), and it is empty. A directory a tool made, or a replacement of the mirror's, stays.
+  - A conflict, or any other sync failure, breaks the mirror. Every later `bash` and file-tool call is refused with the reason, including calls already prepared in the same message.
+- **Change detection:** the backend reports what changed since a token (`Backend.changes`), and an unknown token gets a full listing. Every reported file is pulled and compared by **content hash and mode** with the last sync. So an edit that kept the size and mtime is still found, and a file that was only touched, or the echo of a push, is no change. The host copy is compared by size, mtime, ctime, inode and mode.
+
+## Tools refused with the sandbox
+`eval`, `debug`, `lsp` and `task` are refused with a reason. Each runs code or a server on this machine with the host's filesystem and environment, and a `task` subagent's tools are not confined either. `ast_edit` is refused too: omp 18.20 reports no paths for it (no `approvalCacheTargets`), so the add-on cannot check that it stays inside the copy. Nested calls through `xd://` devices are refused the same way. At startup the add-on checks that every file tool it shadows has such a parser; if one is missing, it refuses everything.
+
+## What still runs on this machine, and other measured limits
+Probed on omp 18.20.0 with a scripted provider (no model):
+- **User `!` commands** typed in omp's TUI run on this machine, as before. They come from the user, not the agent.
+- **Output minimizer:** it recognizes the command inside the rewritten line, and `git status`/`git diff`/`git log` output was identical to native. A large `cat` gets the same outline as native and is then cut once more by bash's output limit, with an artifact link: less output, nothing extra.
+- **Sync cost with LocalBackend** on a 1,455-file, 30 MB tree (a copy of the gitmoot repo on a local SSD): first fill 1.9 s; a pull or push with nothing changed about 0.1 s each; so about 0.2 s per tool call before any remote round trips.
+- **Subagents** (`task`) are refused until their tools can be confined too.
+
+## Configuration
+In the omp process's environment:
 
 | Variable | Meaning |
 |---|---|
 | `OMP_SANDBOX_BACKEND` | `local` (tests). Unset: the add-on does nothing |
 | `OMP_SANDBOX_LOCAL_ROOT` | local backend: the directory that is the sandbox |
 | `OMP_SANDBOX_LOCAL_CONTAINMENT` | local backend: `full` or `process-tree` (default: the best available) |
-| `OMP_SANDBOX_HOST_ROOT` | the host workspace mapped onto the sandbox root (default: omp's cwd) |
+
+omp's cwd is the host copy of the workspace.
 
 ## Backends
 A backend implements `Backend` in [`src/backend.ts`](src/backend.ts):
@@ -40,6 +71,9 @@ A backend implements `Backend` in [`src/backend.ts`](src/backend.ts):
 | `readFile(path)` / `writeFile(path, data, {mode})` | whole-file read and write of regular files; write creates parent directories and keeps an existing file's mode unless `mode` is given |
 | `stat(path)` | type, size and mtime without following a final symlink; `null` if missing |
 | `list(path, {recursive, limit})` | listing sorted by full path in byte order (C collation), so `limit` keeps the sorted prefix; symlinked directories are listed, never entered |
+| `changes(since?)` | what changed in the tree since a token: changed entries plus exact deletes, or the whole tree (`full`) when the token is absent or unknown; `.git` excluded, symlinks reported, never followed. gitmoot v1.1: `workspace changes --since` |
+| `pull(paths)` / `push(files)` | bulk file transfer with modes, relative paths; push is atomic per file and refuses to replace a symlink or directory. gitmoot v1.1: `workspace pull` / `workspace push --files` |
+| `remove(paths)` | unlinks files and symlinks, removes directories only when empty |
 | `containment` | `"full"`: every descendant is killed on timeout or abort, and leftovers are killed when the command's shell exits. `"process-tree"`: every descendant still linked to the command is killed, but a process whose parent already exited, and anything left running after the shell exits, survives |
 
 Every path a backend takes is an absolute path *inside the sandbox*. Translating the agent's host paths to sandbox paths is the tool layer's job. No backend method may ever touch anything outside the sandbox, whatever symlinks or concurrent renames it contains.
@@ -77,9 +111,9 @@ bunx tsc --noEmit # typecheck
 One PR per step, each independently reviewed at its exact head before merge.
 
 1. Backend interface plus `LocalBackend`. *(done, #1 and #2)*
-2. **2a:** the `bash` replacement. *(this PR)*
-   **2b:** `read`, `write`, `edit`, `grep`, `glob` and `find`. They run on a host mirror of the sandbox work tree that is kept in sync with the sandbox, so omp's own tools and their line tags keep working. The add-on refuses to run with `lsp` or `eval` enabled.
-3. A prototype in a throwaway omp agent dir, driven by a scripted provider (no model tokens). It answers whether background jobs, approvals and the output minimizer still work with replaced tools, how `lsp`/`eval` are turned off, what other paths to host execution remain, and how fast the file tools are at repo size.
+2. **2a:** the `bash` replacement. *(done, #3)*
+   **2b:** the file tools, on a host copy kept in sync with the sandbox, so omp's own tools and their snapshot tags keep working; `eval`, `debug`, `lsp`, `task` and `ast_edit` refused. *(this PR)*
+3. A prototype in a throwaway omp agent dir, driven by a scripted provider (no model tokens). It answers whether approvals (interactive prompts) and the output minimizer still work with replaced tools, what other paths to host execution remain (`!` commands, xd:// devices, MCP, plugins), and how fast the sync is at repo size.
 4. The `gitmoot workspace` backend.
 5. ssh and docker backends. The repo goes public after the prototype passes and an independent review.
 
