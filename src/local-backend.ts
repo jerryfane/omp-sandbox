@@ -467,7 +467,7 @@ export class LocalBackend implements Backend {
 				throw mapFsError(error, path.posix.join(this.root, rel));
 			}
 			for (const name of names) {
-				if (rel === "" && name === ".git") continue;
+				if (name.toLowerCase() === ".git") continue;
 				const childRel = rel === "" ? name : `${rel}/${name}`;
 				let info: Stats;
 				try {

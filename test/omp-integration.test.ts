@@ -361,6 +361,8 @@ export default function (pi) {
 			call("eval", { language: "py", code: "print('ran on host')" }),
 			call("read", { path: "sub" }),
 			call("ast_edit", { ops: [{ pat: "host-only", out: "changed" }], paths: [outside] }),
+			call("write", { path: "lib/.git/hooks/post-checkout", content: "#!/bin/sh\n" }),
+			call("read", { path: ".git/config" }),
 		]);
 		const byId = new Map(run.ends.map(end => [end.toolCallId, end]));
 		for (const id of ["call_0", "call_1", "call_2", "call_3", "call_4", "call_5"]) {
@@ -374,6 +376,12 @@ export default function (pi) {
 		expect(byId.get("call_7")?.isError).toBe(false);
 		expect(byId.get("call_8")?.isError).toBe(true);
 		expect(byId.get("call_8")?.text).toContain("ast_edit is not available with the sandbox");
+		for (const id of ["call_9", "call_10"]) {
+			expect(byId.get(id)?.isError).toBe(true);
+			expect(byId.get(id)?.text).toContain("is inside a .git directory");
+		}
+		expect(await Bun.file(path.join(run.hostDir, "lib/.git/hooks/post-checkout")).exists()).toBe(false);
+		expect(await Bun.file(path.join(run.sandboxDir, "lib/.git/hooks/post-checkout")).exists()).toBe(false);
 		expect(await fs.readdir(outside)).toEqual(["secret.txt"]);
 		expect(await fs.readFile(path.join(outside, "secret.txt"), "utf8")).toBe("host-only");
 	}, 120_000);

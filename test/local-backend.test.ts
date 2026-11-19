@@ -403,16 +403,21 @@ describe("tree sync: changes, pull, push, remove", () => {
 		expect((await backend.changes(settled.token)).changed).toEqual([]);
 	});
 
-	test("changes lists the whole tree first, then only what changed, with exact deletes; .git is never listed", async () => {
+	test("changes lists the whole tree first, then only what changed, with exact deletes; no .git at any depth is listed", async () => {
 		await fs.writeFile(path.join(sandboxDir, "a.txt"), "a");
 		await fs.mkdir(path.join(sandboxDir, "d"));
 		await fs.writeFile(path.join(sandboxDir, "d/b.txt"), "b");
 		await fs.mkdir(path.join(sandboxDir, ".git"));
 		await fs.writeFile(path.join(sandboxDir, ".git/HEAD"), "ref");
+		// A nested repository's .git directory and a submodule's .git file.
+		await fs.mkdir(path.join(sandboxDir, "d/.git"));
+		await fs.writeFile(path.join(sandboxDir, "d/.git/HEAD"), "ref");
+		await fs.mkdir(path.join(sandboxDir, "sub"));
+		await fs.writeFile(path.join(sandboxDir, "sub/.git"), "gitdir: ../.git/modules/sub\n");
 		await fs.symlink("/etc/passwd", path.join(sandboxDir, "link"));
 		const first = await backend.changes();
 		expect(first.full).toBe(true);
-		expect(first.changed.map(e => `${e.path}:${e.type}`)).toEqual(["a.txt:file", "d:dir", "d/b.txt:file", "link:symlink"]);
+		expect(first.changed.map(e => `${e.path}:${e.type}`)).toEqual(["a.txt:file", "d:dir", "d/b.txt:file", "link:symlink", "sub:dir"]);
 
 		await new Promise(resolve => setTimeout(resolve, 20));
 		await fs.writeFile(path.join(sandboxDir, "a.txt"), "a2");

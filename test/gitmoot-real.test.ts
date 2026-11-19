@@ -85,7 +85,7 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 	test("a cwd outside the root never reaches the CLI; one the CLI refuses exits 125", async () => {
 		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
 		expect(() => backend.shellCommand("true", { cwd: "/etc" })).toThrow();
-		const line = backend.shellCommand("true", { cwd: backend.root }).replace("--cwd '.'", "--cwd 'no-such-dir'");
+		const line = backend.shellCommand("true", { cwd: backend.root }).replace("--cwd ''", "--cwd 'no-such-dir'");
 		const result = await run(["/bin/bash", "-c", line], os.tmpdir(), cliEnv());
 		expect(result.code).toBe(125);
 		expect(result.stderr).toContain('"error"');
@@ -228,6 +228,30 @@ describe.if(available)("GitmootBackend with the real gitmoot binary (provider=lo
 		await fs.writeFile(path.join(backend.root, "README.md"), "widget, edited in the sandbox\n");
 		await mirror.pullRemote();
 		expect(await fs.readFile(path.join(host, "README.md"), "utf8")).toBe("widget, edited in the sandbox\n");
+	}, 120_000);
+
+	test("real CLI: a nested .git is never listed, pulled or pushed, and the Mirror stays in sync around it", async () => {
+		const backend = await GitmootBackend.open({ bin: BIN, workspace, home });
+		await fs.mkdir(path.join(backend.root, "nested/.git"), { recursive: true });
+		await fs.writeFile(path.join(backend.root, "nested/.git/HEAD"), "ref: refs/heads/main\n");
+		await fs.writeFile(path.join(backend.root, "nested/file.txt"), "f");
+		const all = await backend.changes();
+		expect(all.changed.map(e => e.path).filter(p => p.split("/").includes(".git"))).toEqual([]);
+		const host = await fs.mkdtemp(path.join(scratch, "mirror-git-"));
+		const mirror = await Mirror.create(backend, host);
+		await mirror.pullRemote();
+		expect(await fs.readdir(path.join(host, "nested"))).toEqual(["file.txt"]);
+		await fs.mkdir(path.join(host, "nested/.git"));
+		await fs.writeFile(path.join(host, "nested/.git/config"), "host-made");
+		// Any case: gitmoot refuses .GIT too, so pushing it would break the sync.
+		await fs.mkdir(path.join(host, "nested/.GIT"));
+		await fs.writeFile(path.join(host, "nested/.GIT/config"), "host-made");
+		await fs.writeFile(path.join(host, "nested/file.txt"), "f2");
+		await mirror.pushLocal();
+		expect(await fs.readFile(path.join(backend.root, "nested/file.txt"), "utf8")).toBe("f2");
+		expect(await Bun.file(path.join(backend.root, "nested/.git/config")).exists()).toBe(false);
+		expect(await Bun.file(path.join(backend.root, "nested/.GIT")).exists()).toBe(false);
+		expect(await fs.readFile(path.join(backend.root, "nested/.git/HEAD"), "utf8")).toBe("ref: refs/heads/main\n");
 	}, 120_000);
 
 	test.if(ompInstalled)("installed omp with OMP_SANDBOX_BACKEND=gitmoot: bash and the file tools act on the workspace, never the host", async () => {

@@ -85,7 +85,7 @@ describe("GitmootBackend", () => {
 		const line = backend.shellCommand("exit 125", { cwd: root }).replace(" ws sh ", ` ws sh --status-file '${statusFile}' `);
 		expect((await runLine(line)).code).toBe(125);
 		expect(JSON.parse(await fs.readFile(statusFile, "utf8"))).toEqual({ exit_code: 125, signal: null, timed_out: false, error: null });
-		const outside = backend.shellCommand("true", { cwd: root }).replace("--cwd '.'", `--status-file '${statusFile}' --cwd '../x'`);
+		const outside = backend.shellCommand("true", { cwd: root }).replace("--cwd ''", `--status-file '${statusFile}' --cwd '../x'`);
 		expect((await runLine(outside)).code).toBe(125);
 		expect(JSON.parse(await fs.readFile(statusFile, "utf8")).error.code).toBe("cwd_outside_root");
 	});

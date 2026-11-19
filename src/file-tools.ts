@@ -105,6 +105,9 @@ export function refuseFileCall(tool: NativeFileTool, toolName: string, args: unk
 		if (!isInside(root, file)) {
 			return `omp-sandbox: ${file} is outside the sandboxed workspace ${root}; only paths inside it exist in the sandbox`;
 		}
+		if (path.relative(root, path.resolve(file)).split(path.sep).some(part => part.toLowerCase() === ".git")) {
+			return `omp-sandbox: ${file} is inside a .git directory, which is not copied from the sandbox; use git through bash instead`;
+		}
 	}
 	return undefined;
 }

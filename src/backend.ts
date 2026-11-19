@@ -190,8 +190,8 @@ export interface Backend {
 	 * What changed in the workspace tree since `since` (a token from an
 	 * earlier call), or the whole tree when `since` is absent or unknown.
 	 * `changed` may over-report but never under-report (see Changes).
-	 * Symlinks are reported as entries, never followed. The `.git` directory
-	 * is not part of the tree.
+	 * Symlinks are reported as entries, never followed. A `.git` directory, at
+	 * any depth (submodules and nested repositories too), is not part of the tree.
 	 */
 	changes(since?: string): Promise<Changes>;
 	/**

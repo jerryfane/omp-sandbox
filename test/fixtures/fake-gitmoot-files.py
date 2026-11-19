@@ -79,9 +79,9 @@ def tree(root):
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
         rel_dir = os.path.relpath(dirpath, root)
-        if rel_dir == ".":
-            dirnames[:] = [d for d in dirnames if d != ".git"]
-        for name in sorted(dirnames + filenames):
+        # gitmoot skips every .git, in any letter case (directory or a submodule's .git file), at any depth.
+        dirnames[:] = [d for d in dirnames if d.lower() != ".git"]
+        for name in sorted(dirnames + [f for f in filenames if f.lower() != ".git"]):
             rel = name if rel_dir == "." else f"{rel_dir}/{name}"
             info = os.lstat(os.path.join(dirpath, name))
             # The raw st_mode (type bits included): WORKSPACES.md does not promise permission bits only.
