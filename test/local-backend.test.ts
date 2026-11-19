@@ -384,6 +384,26 @@ describe("files", () => {
 describe("tree sync: changes, pull, push, remove", () => {
 	const bytes = (text: string) => new TextEncoder().encode(text);
 
+	test("an edit that keeps size and mtime is reported even within the clock tick of the last token", async () => {
+		// ctime moves on a coarse clock: most back-to-back edits here leave size,
+		// mtime, ctime and inode all equal. Each one must still be reported.
+		const file = path.join(sandboxDir, "same.txt");
+		await fs.writeFile(file, "a0");
+		let token = (await backend.changes()).token;
+		for (let i = 1; i <= 20; i++) {
+			await fs.writeFile(file, `a${i % 10}`);
+			await fs.utimes(file, 1_000_000_000, 1_000_000_000);
+			const next = await backend.changes(token);
+			expect(next.changed.map(e => e.path)).toContain("same.txt");
+			token = next.token;
+		}
+		// Once the file is older than the racy window, an unchanged one is not reported again.
+		await Bun.sleep(1100);
+		const settled = await backend.changes(token);
+		await Bun.sleep(1100);
+		expect((await backend.changes(settled.token)).changed).toEqual([]);
+	});
+
 	test("changes lists the whole tree first, then only what changed, with exact deletes; .git is never listed", async () => {
 		await fs.writeFile(path.join(sandboxDir, "a.txt"), "a");
 		await fs.mkdir(path.join(sandboxDir, "d"));
@@ -401,7 +421,9 @@ describe("tree sync: changes, pull, push, remove", () => {
 		await fs.writeFile(path.join(sandboxDir, ".git/HEAD"), "moved");
 		const second = await backend.changes(first.token);
 		expect(second.full).toBe(false);
-		expect(second.changed.map(e => e.path)).toEqual(["a.txt"]);
+		// a.txt changed; entries written in the same second may be listed again (never fewer).
+		expect(second.changed.map(e => e.path)).toContain("a.txt");
+		expect(second.changed.map(e => e.path)).not.toContain("d/b.txt");
 		expect(second.deleted).toEqual(["d", "d/b.txt"]);
 
 		const unknown = await backend.changes("not-a-token");

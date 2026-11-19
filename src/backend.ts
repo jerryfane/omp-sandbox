@@ -109,7 +109,12 @@ export interface Changes {
 	 * anything it knows that is not listed as deleted.
 	 */
 	full: boolean;
-	/** Entries created or modified since the token (or every entry when `full`). */
+	/**
+	 * Entries created or modified since the token (or every entry when
+	 * `full`). It may list unchanged entries too (a backend that cannot tell
+	 * from metadata alone reports them), but must never leave out a changed
+	 * one; the caller compares contents.
+	 */
 	changed: TreeEntry[];
 	/** Paths that existed at the token and exist no more. */
 	deleted: string[];
@@ -182,6 +187,7 @@ export interface Backend {
 	/**
 	 * What changed in the workspace tree since `since` (a token from an
 	 * earlier call), or the whole tree when `since` is absent or unknown.
+	 * `changed` may over-report but never under-report (see Changes).
 	 * Symlinks are reported as entries, never followed. The `.git` directory
 	 * is not part of the tree.
 	 */
